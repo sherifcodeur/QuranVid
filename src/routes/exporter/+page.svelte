@@ -166,9 +166,11 @@
 			globalState.getTimelineState.movePreviewTo = globalState.getExportState.videoStartTime;
 			// Hide waveform: consomme des ressources inutilement
 			if (globalState.settings) globalState.settings.persistentUiState.showWaveforms = false;
-			// Divise par 2 le fade duration pour l'export (car l'export le rallonge par deux, ne pas demander pourquoi)
-			globalState.getStyle('global', 'fade-duration')!.value =
-				(globalState.getStyle('global', 'fade-duration')!.value as number) / 2;
+			// Plus besoin de diviser par 2, car le backend gère maintenant correctement le timing
+			globalState.getStyle('global', 'fade-duration')!.value = globalState.getStyle(
+				'global',
+				'fade-duration'
+			)!.value as number;
 
 			const chunkSize = globalState.getExportState.chunkSize;
 			// Formule linéaire: chunkSize=1 -> 10s, chunkSize=200 -> 20s
@@ -391,11 +393,11 @@
 		console.log(`Chunk ${chunkIndex}: ${chunkTimings.uniqueSorted.length} screenshots to take`);
 
 		let i = 0;
-		let base = -fadeDuration; // Pour compenser le fade-in du début
+		let base = 0; // On ne compense plus ici, le backend gère le décalage via le padding ffconcat
 
 		for (const timing of chunkTimings.uniqueSorted) {
 			// Calculer l'index de l'image dans ce chunk (recommence à 0)
-			const imageIndex = Math.max(Math.round(timing - chunkStart + base), 0);
+			const imageIndex = Math.max(Math.round(timing - chunkStart), 0);
 
 			// Vérifie si ce timing doit être dupliqué depuis un autre
 			const sourceTimingForDuplication = Array.from(chunkTimings.duplicableTimings.entries()).find(
@@ -405,10 +407,7 @@
 			// Si c'est dupliquable
 			if (sourceTimingForDuplication !== undefined) {
 				// Ce timing peut être dupliqué depuis sourceTimingForDuplication
-				const sourceIndex = Math.max(
-					Math.round(sourceTimingForDuplication - chunkStart - fadeDuration),
-					0
-				);
+				const sourceIndex = Math.max(Math.round(sourceTimingForDuplication - chunkStart), 0);
 				// Prend que un seul screenshot et le duplique
 				await duplicateScreenshot(`${sourceIndex}`, imageIndex, chunkImageFolder);
 			} else if (
@@ -599,10 +598,10 @@
 		);
 
 		let i = 0;
-		let base = -fadeDuration;
+		let base = 0;
 
 		for (const timing of timings.uniqueSorted) {
-			const imageIndex = Math.max(Math.round(timing - exportStart + base), 0);
+			const imageIndex = Math.max(Math.round(timing - exportStart), 0);
 
 			// Vérifier si ce timing peut être dupliqué depuis un autre
 			const sourceTimingForDuplication = Array.from(timings.duplicableTimings.entries()).find(
@@ -611,10 +610,7 @@
 
 			if (sourceTimingForDuplication !== undefined) {
 				// Ce timing peut être dupliqué depuis sourceTimingForDuplication
-				const sourceIndex = Math.max(
-					Math.round(sourceTimingForDuplication - exportStart - fadeDuration),
-					0
-				);
+				const sourceIndex = Math.max(Math.round(sourceTimingForDuplication - exportStart), 0);
 				await duplicateScreenshot(`${sourceIndex}`, imageIndex);
 				console.log(
 					`Optimisation - Duplicating screenshot from timing ${sourceTimingForDuplication} (image ${sourceIndex}) to timing ${timing} (image ${imageIndex})`

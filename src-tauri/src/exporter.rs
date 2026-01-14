@@ -760,8 +760,8 @@ fn build_and_run_ffmpeg_filter_complex(
         let duration_chunk = durations_s[i];
         
         let s = current_concat_time;
-        // Sans padding, la fin est juste s + duration
-        let e = s + duration_chunk;
+        // On prend l'image avec son padding de fade_s pour que xfade ait de la matière
+        let e = s + duration_chunk + fade_s;
         
         filter_lines.push(format!(
             "[b{}]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS,fps={},split=2[s{}witha][s{}foralpha]",
@@ -770,8 +770,8 @@ fn build_and_run_ffmpeg_filter_complex(
         filter_lines.push(format!("[s{}foralpha]extractplanes=a[s{}a]", i, i));
         filter_lines.push(format!("[s{}witha]format=yuv444p[s{}c]", i, i));
         
-        // Avancer le curseur pour le prochain segment
-        current_concat_time += duration_chunk;
+        // Avancer le curseur de la durée totale de l'entrée concat (image + padding)
+        current_concat_time += duration_chunk + fade_s;
     }
     
     // Chaîne xfade pour couleur et alpha séparément
@@ -792,7 +792,7 @@ fn build_and_run_ffmpeg_filter_complex(
         } else {
             let out_c = format!("xc{}", i);
             let out_a = format!("xa{}", i);
-            let offset = (curr_duration - fade_i).max(0.0);
+            let offset = curr_duration;
             filter_lines.push(format!(
                 "[{}][s{}c]xfade=transition=fade:duration={:.6}:offset={:.6}[{}]",
                 curr_c, i + 1, fade_i, offset, out_c
@@ -804,9 +804,9 @@ fn build_and_run_ffmpeg_filter_complex(
             curr_c = out_c;
             curr_a = out_a;
             
-            // Logique standard sans padding (xfade mange la durée)
-            // Duration = Curr + Next - Fade
-            curr_duration = curr_duration + durations_s[i + 1] - fade_i;
+            // On accumule la durée réelle sans soustraire le fondu, 
+            // car on a paddé les images en amont pour compenser la consommation de xfade.
+            curr_duration += durations_s[i + 1];
         }
     }
     
