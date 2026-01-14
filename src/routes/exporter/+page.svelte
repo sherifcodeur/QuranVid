@@ -936,18 +936,24 @@
 		const scaleY = targetHeight / node.clientHeight;
 		scale = Math.min(scaleX, scaleY);
 
-		// Utilisation de DomToImage pour transformer la div en image
+		// Utilisation de DomToImage pour transformer la div en image avec timeout
 		try {
-			const dataUrl = await DomToImage.toPng(node, {
+			// Timeout de 10 secondes pour éviter le blocage indéfini
+			const screenshotPromise = DomToImage.toPng(node, {
 				width: node.clientWidth * scale,
 				height: node.clientHeight * scale,
 				style: {
 					// Set de la qualité
 					transform: 'scale(' + scale + ')',
 					transformOrigin: 'top left'
-				},
-				quality: 1
+				}
 			});
+
+			const timeoutPromise = new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('DomToImage timeout (10s)')), 10000)
+			);
+
+			const dataUrl = (await Promise.race([screenshotPromise, timeoutPromise])) as string;
 
 			// Si on est en mode portrait, on crop pour avoir un ratio 9:16
 			let finalDataUrl = dataUrl;
@@ -959,13 +965,9 @@
 
 			const filePathWithName = await join(...pathComponents);
 
-			// Convertir dataUrl base64 en ArrayBuffer sans utiliser fetch
-			const base64Data = finalDataUrl.replace(/^data:image\/png;base64,/, '');
-			const binaryString = window.atob(base64Data);
-			const bytes = new Uint8Array(binaryString.length);
-			for (let i = 0; i < binaryString.length; i++) {
-				bytes[i] = binaryString.charCodeAt(i);
-			}
+			// Convertir dataUrl base64 en Uint8Array de manière plus efficace
+			const response = await fetch(finalDataUrl);
+			const bytes = new Uint8Array(await response.arrayBuffer());
 
 			await writeFile(filePathWithName, bytes, { baseDir: BaseDirectory.AppData });
 			console.log('Screenshot saved to:', filePathWithName);
@@ -1124,28 +1126,38 @@
 	 * @param uniqueSorted
 	 */
 	async function wait(timing: number) {
-		// globalState.updateVideoPreviewUI();
-		console.log(`Waiting for frame at ${timing}ms...`);
+		// On attend au moins 2 cycles d'event loop pour laisser Svelte réagir au changement de cursorPosition
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await new Promise((resolve) => setTimeout(resolve, 0));
 
-		// Attend que l'élément `subtitles-container` est une opacité de 1 (visible) (car il est caché pendant que max-height s'applique)
-		let subtitlesContainer: HTMLElement;
-		subtitlesContainer = document.getElementById('subtitles-container') as HTMLElement;
+		let subtitlesContainer = document.getElementById('subtitles-container');
 
+		// Si pas de container, on attend juste un peu pour la forme
 		if (!subtitlesContainer) {
-			await new Promise((resolve) => setTimeout(resolve, 200));
+			await new Promise((resolve) => setTimeout(resolve, 50));
 			return;
 		}
 
 		const startTime = Date.now();
-		const timeout = 1000; // 1000ms maximum timeout to avoid infinite hang
+		const timeout = 1500; // Timeout légèrement augmenté pour les sous-titres complexes
 
-		do {
+		while (true) {
+			// On ré-interroge le DOM pour avoir la version la plus fraîche du container
+			const container = document.getElementById('subtitles-container');
+
+			// Si le container a disparu ou si l'opacité est enfin à 1, on arrête d'attendre
+			if (!container || container.style.opacity === '1') {
+				break;
+			}
+
 			if (Date.now() - startTime > timeout) {
 				console.warn(`Timeout waiting for subtitles-container at ${timing}ms, proceeding anyway.`);
 				break;
 			}
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		} while (subtitlesContainer.style.opacity !== '1');
+
+			// Attente courte avant la prochaine vérification
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
 	}
 </script>
 

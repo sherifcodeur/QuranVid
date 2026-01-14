@@ -199,8 +199,9 @@
 	$effect(() => {
 		(async () => {
 			if (!currentSubtitle()) {
-				if (subtitlesContainer) {
-					subtitlesContainer.style.opacity = '1';
+				const container = document.getElementById('subtitles-container');
+				if (container) {
+					container.style.opacity = '1';
 				}
 				return;
 			}
