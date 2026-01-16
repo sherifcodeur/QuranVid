@@ -1201,9 +1201,7 @@ pub async fn export_video(
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(-1);
     
-    if first_stem != 0 {
-        return Err("La première image doit être '0.png' (timestamp 0 ms).".to_string());
-    }
+
     
     // Timeline et chemins
     let ts: Vec<i32> = files
