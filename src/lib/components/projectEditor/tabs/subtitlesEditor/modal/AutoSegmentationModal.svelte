@@ -505,13 +505,14 @@
 						<!-- Min Silence -->
 						<div>
 							<div class="flex items-center justify-between mb-1">
-								<label class="text-sm text-secondary"
+								<label class="text-sm text-secondary" for="min-silence"
 									>Min Silence Duration <span class="text-xs text-thirdly">(default: 200ms)</span
 									></label
 								>
 								<span class="text-xs text-primary font-mono">{minSilenceMs} ms</span>
 							</div>
 							<input
+								id="min-silence"
 								type="range"
 								min="50"
 								max="1000"
@@ -526,13 +527,14 @@
 						<!-- Min Speech -->
 						<div>
 							<div class="flex items-center justify-between mb-1">
-								<label class="text-sm text-secondary"
+								<label class="text-sm text-secondary" for="min-speech"
 									>Min Speech Duration <span class="text-xs text-thirdly">(default: 1000ms)</span
 									></label
 								>
 								<span class="text-xs text-primary font-mono">{minSpeechMs} ms</span>
 							</div>
 							<input
+								id="min-speech"
 								type="range"
 								min="500"
 								max="3000"
@@ -547,12 +549,13 @@
 						<!-- Padding -->
 						<div>
 							<div class="flex items-center justify-between mb-1">
-								<label class="text-sm text-secondary"
+								<label class="text-sm text-secondary" for="padding"
 									>Padding <span class="text-xs text-thirdly">(default: 50ms)</span></label
 								>
 								<span class="text-xs text-primary font-mono">{padMs} ms</span>
 							</div>
 							<input
+								id="padding"
 								type="range"
 								min="0"
 								max="300"
