@@ -4,10 +4,13 @@
 
 	let isDragging = $state(false);
 	let containerRef: HTMLElement | null = $state(null);
+	let diviseurElement: HTMLElement;
 
 	onMount(() => {
 		// containerRef = parent de ce composant
-		containerRef = document.querySelector('.diviseur')?.parentNode as HTMLElement;
+		if (diviseurElement) {
+			containerRef = diviseurElement.parentNode as HTMLElement;
+		}
 	});
 
 	function startResize(e: MouseEvent) {
@@ -37,6 +40,7 @@
 
 <!-- Diviseur redimensionnable -->
 <div
+	bind:this={diviseurElement}
 	class="h-0.75 bg-secondary cursor-row-resize flex-shrink-0 diviseur {isDragging
 		? 'bg-blue-500'
 		: ''}"
