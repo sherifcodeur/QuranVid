@@ -88,20 +88,23 @@
 			globalState.getVideoStyle.getStylesOfTarget(target).getEffectiveValue('opacity', clipId)
 		);
 
+		// Si on est en export "Fast", on ignore le fondu CSS car FFmpeg s'en occupe
+		if (globalState.exportFullOpacity) return maxOpacity;
+
 		const currentTime = getTimelineSettings().cursorPosition;
 		const endTime = subtitle.endTime;
 		const timeLeft = endTime - currentTime;
-		const halfFade = fadeDuration() / 2;
+		const fade = fadeDuration(); // Utilise la durée totale au lieu de la moitié
 
-		if (timeLeft <= halfFade) {
-			return Math.max(0, (timeLeft / halfFade) * maxOpacity);
+		if (timeLeft <= fade) {
+			return Math.max(0, (timeLeft / fade) * maxOpacity);
 		}
 
 		const startTime = subtitle.startTime;
 		const timeSinceStart = currentTime - startTime;
 
-		if (timeSinceStart <= halfFade) {
-			return Math.min(maxOpacity, (timeSinceStart / halfFade) * maxOpacity);
+		if (timeSinceStart <= fade) {
+			return Math.min(maxOpacity, (timeSinceStart / fade) * maxOpacity);
 		}
 
 		return maxOpacity;

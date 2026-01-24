@@ -50,6 +50,9 @@ class GlobalState {
 		isSettingsOpen: false
 	});
 
+	// Utilisé pendant l'export pour ignorer les fondus CSS et capturer les images à pleine opacité
+	exportFullOpacity = $state(false);
+
 	get getSubtitleTrack() {
 		return this.currentProject!.content.timeline.getFirstTrack(
 			TrackType.Subtitle

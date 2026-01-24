@@ -33,6 +33,14 @@ fn should_prefer_hw_encoding() -> bool {
 // Gestionnaire des processus actifs pour pouvoir les annuler
 static ACTIVE_EXPORTS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Option<std::process::Child>>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Structure pour gérer un export en flux direct (streaming)
+struct StreamingSession {
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
+}
+
+// Gestionnaire des sessions de streaming actives
+static ACTIVE_STREAMS: LazyLock<Mutex<HashMap<String, Arc<StreamingSession>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 // Fonction utilitaire pour configurer les commandes et cacher les fenêtres CMD sur Windows
 fn configure_command_no_window(cmd: &mut Command) {
     #[cfg(target_os = "windows")]
@@ -405,6 +413,7 @@ fn is_image_file(path: &str) -> bool {
 }
 
 fn preprocess_background_videos(video_paths: &[String], w: i32, h: i32, fps: i32, prefer_hw: bool, start_time_ms: i32, duration_ms: Option<i32>, blur: Option<f64>) -> Vec<String> {
+    println!("[preproc] Début du prétraitement pour {} vidéos/images...", video_paths.len());
     let mut out_paths = Vec::new();
     let cache_dir = std::env::temp_dir().join("qurancaption-preproc");
     fs::create_dir_all(&cache_dir).ok();
@@ -470,7 +479,7 @@ fn preprocess_background_videos(video_paths: &[String], w: i32, h: i32, fps: i32
         }
 
         // Déterminer le début à l'intérieur de cette vidéo
-        let start_within = if start_time_ms as i64 > cum_start { (start_time_ms as i64 - cum_start) } else { 0 };
+        let start_within = if start_time_ms as i64 > cum_start { start_time_ms as i64 - cum_start } else { 0 };
 
         // Durée restante à prendre dans cette vidéo
         let elapsed_from_start = (cum_start + start_within) - (start_time_ms as i64);
@@ -490,6 +499,8 @@ fn preprocess_background_videos(video_paths: &[String], w: i32, h: i32, fps: i32
         let stem_hash = format!("{:x}", md5::compute(hash_input.as_bytes()));
         let stem_hash = &stem_hash[..10.min(stem_hash.len())];
         let dst = cache_dir.join(format!("bg-{}-{}x{}-{}.mp4", stem_hash, w, h, fps));
+
+        println!("[preproc] Traitement du segment {}/{} -> {:?}", idx + 1, video_paths.len(), dst.file_name());
 
         if !dst.exists() {
             // Appeler ffmpeg_preprocess_video avec les offsets locaux
@@ -561,6 +572,235 @@ fn video_has_audio(path: &str) -> bool {
     }
 }
 
+struct ExportTimings {
+    durations_s: Vec<f64>,
+    start_s: f64,
+    duration_s: f64,
+}
+
+fn calculate_export_timings(
+    timestamps_ms: &[i32],
+    fps: i32,
+    fade_duration_ms: i32,
+    start_time_ms: i32,
+    duration_ms: Option<i32>,
+    is_high_fidelity: bool,
+) -> ExportTimings {
+    let n = timestamps_ms.len();
+    let tail_ms = fade_duration_ms.max(1000);
+    let frame_duration = 1.0 / (fps as f64);
+    
+    let snap_time = |ms: i32| -> f64 {
+        let seconds = ms as f64 / 1000.0;
+        let frames = (seconds / frame_duration).round();
+        frames * frame_duration
+    };
+
+    let start_s = snap_time(start_time_ms);
+    let end_ms = if let Some(dur_ms) = duration_ms {
+        start_time_ms + dur_ms
+    } else {
+        timestamps_ms[n - 1] + tail_ms
+    };
+    let end_s = snap_time(end_ms);
+    let duration_s_total = (end_s - start_s).max(frame_duration);
+    
+    let mut raw_durations = Vec::new();
+    for i in 0..n {
+        let t_curr = timestamps_ms[i];
+        let t_next = if i < n - 1 { timestamps_ms[i + 1] } else { timestamps_ms[i] + tail_ms };
+        let dur = (snap_time(t_next) - snap_time(t_curr)).max(0.001);
+        raw_durations.push(dur);
+    }
+
+    let mut durations_s = Vec::new();
+    if is_high_fidelity {
+        durations_s = raw_durations;
+    } else {
+        // En mode Fast, on ne regroupe pas ici car build_filter_complex a besoin des labels individuels
+        durations_s = raw_durations;
+    }
+    
+    ExportTimings {
+        durations_s,
+        start_s,
+        duration_s: duration_s_total,
+    }
+}
+
+struct FilterContext {
+    filter_complex: String,
+    have_audio: bool,
+    current_idx: i32,
+    bg_start_idx: i32,
+    audio_start_idx: i32,
+    total_bg_s: f64,
+}
+fn build_filter_complex_content(
+    w: i32,
+    h: i32,
+    fps: i32,
+    fade_s: f64,
+    n: usize,
+    durations_s: &[f64],
+    start_s: f64,
+    duration_s: f64,
+    pre_videos: &[String],
+    audio_paths: &[String],
+    audio_start_idx: i32,
+    bg_start_idx: i32,
+    current_idx: i32,
+    is_streaming: bool,
+    is_high_fidelity: bool,
+) -> FilterContext {
+    let mut filter_lines = Vec::new();
+    let mut cur_idx = current_idx;
+
+    let overlay_label = if is_streaming && is_high_fidelity {
+        // Mode Linéaire (Fidélité Totale) : Le flux pipe contient déjà la séquence complète capturée à 30fps
+        filter_lines.push(format!(
+            "[0:v]format=rgba,scale=w={}:h={}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={},setpts=PTS-STARTPTS,setsar=1,format=yuva420p[lin_overlay]",
+            w, h, w, h, fps
+        ));
+        "lin_overlay".to_string()
+    } else {
+        // Mode Rapide (Fade Linéaire) : Découpage intelligent par CLIPS logiques
+        let mut split_outputs = String::new();
+        for i in 0..n {
+            split_outputs.push_str(&format!("[b{}]", i));
+        }
+        
+        filter_lines.push(format!(
+            "[0:v]format=rgba,scale=w={}:h={}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={},setpts=PTS-STARTPTS,setsar=1,format=yuva420p,split={}{}",
+            w, h, w, h, fps, n, split_outputs
+        ));
+        
+        // --- LOGIQUE DE GROUPEMENT PAR CLIPS ---
+        // On regroupe les segments qui pointent sur les mêmes timings (identiques)
+        struct GroupedClip {
+            input_indices: Vec<usize>,
+            pure_duration: f64,
+            pipe_start: f64,
+        }
+        let mut groups: Vec<GroupedClip> = Vec::new();
+        let mut current_pipe_pos = 0.0;
+        
+        for i in 0..n {
+            let dur = durations_s[i];
+            // Pour l'instant on garde simple: on ne regroupe que si c'est vraiment collé
+            // Mais en streaming Fast, chaque index i est une image unique
+            // Cependant, le frontend peut envoyer plusieurs fois vers des timings proches.
+            // On va traiter chaque segment comme un clip pour FFmpeg MAIS on s'assure
+            // que si le segment est la suite d'un silence ou d'un changement, FFmpeg gère.
+            
+            groups.push(GroupedClip {
+                input_indices: vec![i],
+                pure_duration: dur,
+                pipe_start: current_pipe_pos,
+            });
+            current_pipe_pos += dur;
+        }
+
+        let mut concat_inputs = String::new();
+        for (idx, group) in groups.iter().enumerate() {
+            let s = group.pipe_start;
+            let e = s + group.pure_duration;
+            let d = group.pure_duration;
+            
+            // Sécurité fondu
+            let safe_fade = fade_s.min(d / 2.0);
+            let fade_out_start = (d - safe_fade).max(0.0);
+
+            // On ne peut trimmer qu'un seul index b{} à la fois
+            // Note: on utilise le premier index du groupe pour l'image source
+            let src_idx = group.input_indices[0];
+
+            filter_lines.push(format!(
+                "[b{}]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS,fade=t=in:st=0:d={:.6}:alpha=1,fade=t=out:st={:.6}:d={:.6}:alpha=1[s{}]",
+                src_idx, s, e, safe_fade, fade_out_start, safe_fade, idx
+            ));
+            
+            concat_inputs.push_str(&format!("[s{}]", idx));
+        }
+        
+        filter_lines.push(format!("{}concat=n={}:v=1:a=0[comp_overlay]", concat_inputs, groups.len()));
+        "comp_overlay".to_string()
+    };
+    
+    let mut total_bg_s = 0.0;
+    for p in pre_videos {
+        total_bg_s += ffprobe_duration_sec(p);
+    }
+    
+    let bg_label = if pre_videos.is_empty() || total_bg_s <= 1e-6 {
+        let color_full_idx = cur_idx;
+        cur_idx += 1;
+        // On ne peut pas mettre le -f lavfi ici, il sera ajouté dans le cmd builder
+        format!("{}:v", color_full_idx)
+    } else {
+        let prev = if pre_videos.len() > 1 {
+            let mut ins = String::new();
+            for (i, _) in pre_videos.iter().enumerate() {
+                ins.push_str(&format!("[{}:v]", bg_start_idx + i as i32));
+            }
+            filter_lines.push(format!("{}concat=n={}:v=1:a=0[bgcat]", ins, pre_videos.len()));
+            "bgcat".to_string()
+        } else {
+            format!("{}:v", bg_start_idx)
+        };
+        
+        filter_lines.push(format!("[{}]setpts=PTS-STARTPTS,setsar=1[bgtrim]", prev));
+        let mut bl = "bgtrim".to_string();
+        
+        if total_bg_s + 1e-6 < duration_s {
+            let remain = duration_s - total_bg_s;
+            let color_pad_idx = cur_idx;
+            cur_idx += 1;
+            filter_lines.push(format!("[{}:v]setsar=1[colorpad]", color_pad_idx));
+            filter_lines.push(format!("[bgtrim][colorpad]concat=n=2:v=1:a=0[bg]"));
+            bl = "bg".to_string();
+        }
+        bl
+    };
+    
+    filter_lines.push(format!("[{}][{}]overlay=shortest=1:x=0:y=0,format=yuv420p[vout]", bg_label, overlay_label));
+    
+    let mut total_audio_s = 0.0;
+    for p in audio_paths {
+        total_audio_s += ffprobe_duration_sec(p);
+    }
+    let have_audio = !audio_paths.is_empty() && start_s < total_audio_s - 1e-6;
+
+    if have_audio {
+        let a = audio_paths.len();
+        if a == 1 {
+            let a_idx = format!("{}:a", audio_start_idx);
+            filter_lines.push(format!("[{}]aresample=48000[aa0]", a_idx));
+            filter_lines.push(format!("[aa0]atrim=start={:.6},asetpts=PTS-STARTPTS,atrim=end={:.6}[aout]", start_s, duration_s));
+        } else {
+            for j in 0..a {
+                let idx = audio_start_idx + j as i32;
+                filter_lines.push(format!("[{}:a]aresample=48000[aa{}]", idx, j));
+            }
+            let mut ins = String::new();
+            for j in 0..a {
+                ins.push_str(&format!("[aa{}]", j));
+            }
+            filter_lines.push(format!("{}concat=n={}:v=0:a=1[aacat]", ins, a));
+            filter_lines.push(format!("[aacat]atrim=start={:.6},asetpts=PTS-STARTPTS,atrim=end={:.6}[aout]", start_s, duration_s));
+        }
+    }
+    
+    FilterContext {
+        filter_complex: filter_lines.join(";"),
+        have_audio,
+        current_idx: cur_idx,
+        bg_start_idx,
+        audio_start_idx,
+        total_bg_s,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_and_run_ffmpeg_filter_complex(
     export_id: &str,
@@ -582,93 +822,23 @@ fn build_and_run_ffmpeg_filter_complex(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let (w, h) = target_size;
     let fade_s = (fade_duration_ms as f64 / 1000.0).max(0.0);
-    let start_s = (start_time_ms as f64 / 1000.0).max(0.0);
     
     let n = image_paths.len();
     if n == 0 {
         return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Aucune image fournie")));
     }
-    if n != timestamps_ms.len() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Le nombre d'images ne correspond pas au nombre de timestamps")));
-    }
     
-    let tail_ms = fade_duration_ms.max(1000);
-    let mut durations_s = Vec::new();
-    
-    for i in 0..n {
-        if i < n - 1 {
-            durations_s.push(((timestamps_ms[i + 1] - timestamps_ms[i]) as f64 / 1000.0).max(0.001));
-        } else {
-            durations_s.push((tail_ms as f64 / 1000.0).max(0.001));
-        }
-    }
-    
-    let total_by_ts = (timestamps_ms[n - 1] + tail_ms) as f64 / 1000.0;
-    
-    // Note: durations_s will be recalculated below with snapping logic
-    // We keep existing logic for now just to satisfy variable initialization before override
-    // SNAP TO GRID (GLOBAL): Align start/end to absolute frame boundaries
-    // This prevents cumulative drift (desync) while ensuring no gaps (glitches).
-    let frame_duration = 1.0 / (fps as f64);
-    
-    // Helper function to snap a timestamp (ms) to the nearest frame time (s)
-    let snap_time = |ms: i32| -> f64 {
-        let seconds = ms as f64 / 1000.0;
-        let frames = (seconds / frame_duration).round();
-        frames * frame_duration
-    };
+    let timings = calculate_export_timings(timestamps_ms, fps, fade_duration_ms, start_time_ms, duration_ms, false);
+    let durations_s = timings.durations_s;
+    let start_s = timings.start_s;
+    let duration_s = timings.duration_s;
 
-    let start_s = snap_time(start_time_ms);
-    // Use snap(end) - snap(start) for total duration
-    // End time is start_time + calculated duration
-    let end_ms = if let Some(dur_ms) = duration_ms {
-        start_time_ms + dur_ms
-    } else {
-        (total_by_ts * 1000.0) as i32
-    };
-    let end_s = snap_time(end_ms);
-    let duration_s = (end_s - start_s).max(frame_duration);
-    
-    let mut starts_s = Vec::new(); // Not strictly needed anymore for calculation but kept for logic structure
-    // Recalculate durations_s using the same snapping logic
-    durations_s.clear();
-    
-    for i in 0..n {
-        let t_curr = timestamps_ms[i];
-        let t_next = if i < n - 1 { timestamps_ms[i + 1] } else { timestamps_ms[i] + tail_ms };
-        
-        let s_curr = snap_time(t_curr);
-        let s_next = snap_time(t_next);
-        
-        // Duration is difference between snapped timestamps => precise frame count
-        let dur = (s_next - s_curr).max(0.001);
-        durations_s.push(dur);
-    }
-    
-    // Rebuild starts logic for verify
-    let mut acc = 0.0;
-    for &d in &durations_s {
-        starts_s.push(acc);
-        acc += d;
-    }
-    
     let (vcodec, vparams, vextra) = choose_best_codec(prefer_hw);
     
     let mut pre_videos = Vec::new();
     if !bg_videos.is_empty() {
         pre_videos = preprocess_background_videos(bg_videos, w, h, fps, prefer_hw, start_time_ms, duration_ms, blur);
     }
-    
-    let mut total_bg_s = 0.0;
-    for p in &pre_videos {
-        total_bg_s += ffprobe_duration_sec(p);
-    }
-    
-    let mut total_audio_s = 0.0;
-    for p in audio_paths {
-        total_audio_s += ffprobe_duration_sec(p);
-    }
-    let have_audio = !audio_paths.is_empty() && start_s < total_audio_s - 1e-6;
     
     // Préparer le fichier concat
     let base_dir = if let Some(cwd) = imgs_cwd {
@@ -687,18 +857,11 @@ fn build_and_run_ffmpeg_filter_complex(
     for (i, p) in image_paths.iter().enumerate() {
         let escaped = path_utils::escape_ffconcat_path(p);
         writeln!(concat_file, "file '{}'", escaped)?;
-        // Ajouter le fade_s à chaque image pour avoir de la "marge" pour le xfade
-        // SAUF pour la toute dernière si on ne veut pas de marge à la fin, 
-        // mais pour simplifier la logique de trim on peut l'ajouter partout.
-        // Le xfade mangera cette marge.
         let duration_with_padding = durations_s[i] + fade_s;
         writeln!(concat_file, "duration {:.6}", duration_with_padding)?;
     }
-    // Dernière entrée neutre pour fermer le concat (pas utilisée visuellement)
     let escaped_last = path_utils::escape_ffconcat_path(&image_paths[n - 1]);
     writeln!(concat_file, "file '{}'", escaped_last)?;
-    
-    println!("[concat] Fichier ffconcat -> {:?}", concat_path);
     
     let mut cmd = Vec::new();
     let ffmpeg_exe = resolve_ffmpeg_binary().unwrap_or_else(|| "ffmpeg".to_string());
@@ -714,196 +877,57 @@ fn build_and_run_ffmpeg_filter_complex(
         "-progress".to_string(), "pipe:2".to_string(),
     ]);
     
-    // Entrée unique: concat demuxer
     let concat_name = concat_path.to_string_lossy().to_string();
-    
     cmd.extend_from_slice(&[
         "-safe".to_string(), "0".to_string(),
         "-f".to_string(), "concat".to_string(),
         "-i".to_string(), concat_name,
     ]);
-    let mut current_idx = 1;
     
-    // Entrées vidéos de fond
+    let mut current_idx = 1;
     let bg_start_idx = current_idx;
     for p in &pre_videos {
         cmd.extend_from_slice(&["-i".to_string(), p.clone()]);
         current_idx += 1;
     }
     
-    // Entrées audio
     let audio_start_idx = current_idx;
-    if have_audio {
+    // On ne sait pas encore si on a de l'audio avant build_filter_complex_content
+    // mais on ajoute les entrées quand même si audio_paths n'est pas vide
+    if !audio_paths.is_empty() {
         for p in audio_paths {
             cmd.extend_from_slice(&["-i".to_string(), p.clone()]);
             current_idx += 1;
         }
     }
+
+    let filter_ctx = build_filter_complex_content(
+        w, h, fps, fade_s, n, &durations_s, start_s, duration_s, 
+        &pre_videos, audio_paths, audio_start_idx, bg_start_idx, current_idx, false, false
+    );
     
-    let mut filter_lines = Vec::new();
-    
-    // Base: préparer le flux vidéo unique [0:v]
-    let mut split_outputs = String::new();
-    for i in 0..n {
-        split_outputs.push_str(&format!("[b{}]", i));
-    }
-    
-    filter_lines.push(format!(
-        "[0:v]format=rgba,scale=w={}:h={}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black@0,fps={},setpts=PTS-STARTPTS,setsar=1,format=yuva444p,split={}{}",
-        w, h, w, h, fps, n, split_outputs
-    ));
-    
-    // Pour chaque segment, extraire la fenêtre temporelle et séparer couleur/alpha
-    // Pour chaque segment, extraire la fenêtre temporelle et séparer couleur/alpha
-    let mut current_concat_time = 0.0;
-    for i in 0..n {
-        let duration_chunk = durations_s[i];
-        
-        let s = current_concat_time;
-        // On prend l'image avec son padding de fade_s pour que xfade ait de la matière
-        let e = s + duration_chunk + fade_s;
-        
-        filter_lines.push(format!(
-            "[b{}]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS,fps={},split=2[s{}witha][s{}foralpha]",
-            i, s, e, fps, i, i
-        ));
-        filter_lines.push(format!("[s{}foralpha]extractplanes=a[s{}a]", i, i));
-        filter_lines.push(format!("[s{}witha]format=yuv444p[s{}c]", i, i));
-        
-        // Avancer le curseur de la durée totale de l'entrée concat (image + padding)
-        current_concat_time += duration_chunk + fade_s;
-    }
-    
-    // Chaîne xfade pour couleur et alpha séparément
-    let mut curr_c = "s0c".to_string();
-    let mut curr_a = "s0a".to_string();
-    let mut curr_duration = durations_s[0];
-    
-    for i in 0..(n - 1) {
-        let fade_i = durations_s[i].min(fade_s);
-        if fade_i <= 1e-6 {
-            let out_c = format!("cc{}", i);
-            let out_a = format!("ca{}", i);
-            filter_lines.push(format!("[{}][s{}c]concat=n=2:v=1:a=0[{}]", curr_c, i + 1, out_c));
-            filter_lines.push(format!("[{}][s{}a]concat=n=2:v=1:a=0[{}]", curr_a, i + 1, out_a));
-            curr_c = out_c;
-            curr_a = out_a;
-            curr_duration += durations_s[i + 1];
-        } else {
-            let out_c = format!("xc{}", i);
-            let out_a = format!("xa{}", i);
-            let offset = curr_duration;
-            filter_lines.push(format!(
-                "[{}][s{}c]xfade=transition=fade:duration={:.6}:offset={:.6}[{}]",
-                curr_c, i + 1, fade_i, offset, out_c
-            ));
-            filter_lines.push(format!(
-                "[{}][s{}a]xfade=transition=fade:duration={:.6}:offset={:.6}[{}]",
-                curr_a, i + 1, fade_i, offset, out_a
-            ));
-            curr_c = out_c;
-            curr_a = out_a;
-            
-            // On accumule la durée réelle sans soustraire le fondu, 
-            // car on a paddé les images en amont pour compenser la consommation de xfade.
-            curr_duration += durations_s[i + 1];
-        }
-    }
-    
-    // Reconstituer RGBA pour l'overlay final
-    filter_lines.push(format!("[{}][{}]alphamerge,format=yuva444p[overlay]", curr_c, curr_a));
-    
-    // DEBUG: On a retiré le TRIM ici car il causait un "Jump to last".
-    // On revient à l'état désynchronisé mais stable pour investiguer.
-    // filter_lines.push(format!("[overlay_raw]trim=start={:.6}:end={:.6},setpts=PTS-STARTPTS[overlay]", start_s, end_s));
-    
-    // Construction de la vidéo de fond [bg]
-    let avail_bg_after = total_bg_s;
-    let need_black_full = pre_videos.is_empty() || avail_bg_after <= 1e-6;
-    
-    let bg_label = if need_black_full {
-        let color_full_idx = current_idx;
+    let filter_complex = filter_ctx.filter_complex;
+    let have_audio = filter_ctx.have_audio;
+    let _final_idx = filter_ctx.current_idx;
+
+    if pre_videos.is_empty() || filter_ctx.total_bg_s <= 1e-6 {
         cmd.extend_from_slice(&[
             "-f".to_string(), "lavfi".to_string(),
             "-i".to_string(), format!("color=c=black:s={}x{}:r={}:d={:.6}", w, h, fps, duration_s),
         ]);
-        format!("{}:v", color_full_idx)
-    } else {
-        let prev = if pre_videos.len() > 1 {
-            let mut ins = String::new();
-            for i in 0..pre_videos.len() {
-                ins.push_str(&format!("[{}:v]", bg_start_idx + i));
-            }
-            filter_lines.push(format!("{}concat=n={}:v=1:a=0[bgcat]", ins, pre_videos.len()));
-            "bgcat".to_string()
-        } else {
-            format!("{}:v", bg_start_idx)
-        };
-        
-        filter_lines.push(format!("[{}]setpts=PTS-STARTPTS,setsar=1[bgtrim]", prev));
-        let mut bg_label = "bgtrim".to_string();
-        
-        if avail_bg_after + 1e-6 < duration_s {
-            let remain = duration_s - avail_bg_after;
-            let color_pad_idx = current_idx;
-            cmd.extend_from_slice(&[
-                "-f".to_string(), "lavfi".to_string(),
-                "-i".to_string(), format!("color=c=black:s={}x{}:r={}:d={:.6}", w, h, fps, remain),
-            ]);
-            filter_lines.push(format!("[{}:v]setsar=1[colorpad]", color_pad_idx));
-            filter_lines.push(format!("[bgtrim][colorpad]concat=n=2:v=1:a=0[bg]"));
-            bg_label = "bg".to_string();
-        }
-        
-        bg_label
-    };
-    
-    // Superposition de l'overlay (avec alpha) sur le fond
-    filter_lines.push(format!("[{}]setsar=1[bg_normalized]", bg_label));
-    filter_lines.push(format!("[bg_normalized][overlay]overlay=shortest=1:x=0:y=0,format=yuv420p[vout]"));
-    
-    // Audio: concat, skip start_s, clamp à duration_s
-    if have_audio {
-        let a = audio_paths.len();
-        if a == 1 {
-            let a0 = format!("{}:a", audio_start_idx);
-            filter_lines.push(format!("[{}]aresample=48000[aa0]", a0));
-            filter_lines.push(format!("[aa0]atrim=start={:.6},asetpts=PTS-STARTPTS,atrim=end={:.6}[aout]", start_s, duration_s));
-        } else {
-            for j in 0..a {
-                let idx = audio_start_idx + j;
-                filter_lines.push(format!("[{}:a]aresample=48000[aa{}]", idx, j));
-            }
-            let mut ins = String::new();
-            for j in 0..a {
-                ins.push_str(&format!("[aa{}]", j));
-            }
-            filter_lines.push(format!("{}concat=n={}:v=0:a=1[aacat]", ins, a));
-            filter_lines.push(format!("[aacat]atrim=start={:.6},asetpts=PTS-STARTPTS,atrim=end={:.6}[aout]", start_s, duration_s));
-        }
+    } else if filter_ctx.total_bg_s + 1e-6 < duration_s {
+        let remain = duration_s - filter_ctx.total_bg_s;
+        cmd.extend_from_slice(&[
+            "-f".to_string(), "lavfi".to_string(),
+            "-i".to_string(), format!("color=c=black:s={}x{}:r={}:d={:.6}", w, h, fps, remain),
+        ]);
     }
     
-    let filter_complex = filter_lines.join(";");
-    
-    // Écrit le filtergraph dans un fichier temporaire
-    let tmp_dir = if let Some(cwd) = imgs_cwd {
-        PathBuf::from(cwd)
-    } else {
-        std::env::temp_dir()
-    };
-    fs::create_dir_all(&tmp_dir).ok();
-    
-    let fg_hash = format!("{:x}", md5::compute(filter_complex.as_bytes()));
-    let fg_path = tmp_dir.join(format!("filter-{}.ffgraph", &fg_hash[..8]));
-    
+    let tmp_dir = std::env::temp_dir();
+    let fg_path = tmp_dir.join(format!("filter-{}.ffgraph", &format!("{:x}", md5::compute(filter_complex.as_bytes()))[..8]));
     fs::write(&fg_path, &filter_complex)?;
-    println!("[ffmpeg] filter_complex_script -> {:?}", fg_path);
     
-    let fg_name = fg_path.to_string_lossy().to_string();
-    
-    cmd.extend_from_slice(&["-filter_complex_script".to_string(), fg_name]);
-    
-    // Mapping
+    cmd.extend_from_slice(&["-filter_complex_script".to_string(), fg_path.to_string_lossy().to_string()]);
     cmd.extend_from_slice(&["-map".to_string(), "[vout]".to_string()]);
     if have_audio {
         cmd.extend_from_slice(&["-map".to_string(), "[aout]".to_string()]);
@@ -973,7 +997,7 @@ fn build_and_run_ffmpeg_filter_complex(
     // Configurer la commande pour cacher les fenêtres CMD sur Windows
     configure_command_no_window(&mut command);
     
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
     
     // Enregistrer le processus dans les exports actifs
     let process_ref = Arc::new(Mutex::new(Some(child)));
@@ -1195,7 +1219,7 @@ pub async fn export_video(
         return Err("Aucune image .png trouvée dans imgs_folder".to_string());
     }
     
-    let first_stem = files[0]
+    let _first_stem = files[0]
         .file_stem()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<i32>().ok())
@@ -1365,31 +1389,31 @@ fn parse_ffmpeg_time(time_str: &str) -> f64 {
 }
 
 #[tauri::command]
-pub fn cancel_export(export_id: String) -> Result<String, String> {
+pub async fn cancel_export(export_id: String) -> Result<String, String> {
     println!("[cancel_export] Demande d'annulation pour export_id: {}", export_id);
-    
+
+    // 1. Fermer le flux de streaming si il existe
+    {
+        let mut streams = ACTIVE_STREAMS.lock().map_err(|e| e.to_string())?;
+        if let Some(_session) = streams.remove(&export_id) {
+            println!("[cancel_export] Fermeture du flux stdin pour {}", export_id);
+            // session est retiré de la map et sera droppé à la fin de ce bloc,
+            // ce qui fermera le stdin si c'était la dernière référence.
+        }
+    }
+
+    // 2. Tuer le processus
     let mut active_exports = ACTIVE_EXPORTS.lock().map_err(|_| "Failed to lock active exports")?;
-    
     if let Some(process_ref) = active_exports.remove(&export_id) {
-        if let Ok(mut process_guard) = process_ref.lock() {
-            if let Some(mut child) = process_guard.take() {
-                match child.kill() {
-                    Ok(_) => {
-                        println!("[cancel_export] Processus FFmpeg tué avec succès pour export_id: {}", export_id);
-                        let _ = child.wait(); // Nettoyer le processus zombie
-                        Ok(format!("Export {} annulé avec succès", export_id))
-                    },
-                    Err(e) => {
-                        println!("[cancel_export] Erreur lors de l'arrêt du processus: {:?}", e);
-                        Err(format!("Erreur lors de l'annulation: {}", e))
-                    }
-                }
-            } else {
-                println!("[cancel_export] Aucun processus actif trouvé pour export_id: {}", export_id);
-                Err(format!("Aucun processus actif pour l'export {}", export_id))
-            }
+        let mut child_guard = process_ref.lock().unwrap();
+        if let Some(mut child) = child_guard.take() {
+            println!("[cancel_export] Suppression forcée du processus FFmpeg {}", export_id);
+            let _ = child.kill();
+            let _ = child.wait(); // Nettoyer
+            Ok(format!("Export {} annulé avec succès", export_id))
         } else {
-            Err("Failed to lock process".to_string())
+            println!("[cancel_export] Processus déjà terminé ou pris par un autre fil pour {}", export_id);
+            Ok(format!("Export {} déjà terminé", export_id))
         }
     } else {
         println!("[cancel_export] Export_id non trouvé dans les exports actifs: {}", export_id);
@@ -1519,4 +1543,301 @@ pub async fn concat_videos(
     
     println!("[concat_videos] ✅ Concaténation réussie: {}", output_path_str);
     Ok(output_path_str)
+}
+
+#[tauri::command]
+pub async fn start_streaming_export(
+    export_id: String,
+    out_path: String,
+    timestamps_ms: Vec<i32>,
+    target_size: (i32, i32),
+    fps: i32,
+    fade_duration_ms: i32,
+    start_time_ms: i32,
+    audio_paths: Vec<String>,
+    bg_videos: Vec<String>,
+    prefer_hw: bool,
+    duration_ms: Option<i32>,
+    chunk_index: Option<i32>,
+    blur: Option<f64>,
+    is_high_fidelity: bool,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let (w, h) = target_size;
+    let fade_s = (fade_duration_ms as f64 / 1000.0).max(0.0);
+    let n = timestamps_ms.len();
+    
+    let timings = calculate_export_timings(&timestamps_ms, fps, fade_duration_ms, start_time_ms, duration_ms, is_high_fidelity);
+    let durations_s = timings.durations_s;
+    let start_s = timings.start_s;
+    let duration_s = timings.duration_s;
+
+    let (vcodec, vparams, vextra) = choose_best_codec(prefer_hw);
+
+    let mut pre_videos = Vec::new();
+    if !bg_videos.is_empty() {
+        pre_videos = preprocess_background_videos(&bg_videos, w, h, fps, prefer_hw, start_time_ms, duration_ms, blur);
+    }
+
+    let mut cmd_args = Vec::new();
+    let ffmpeg_exe = resolve_ffmpeg_binary().ok_or("FFmpeg not found")?;
+    cmd_args.extend_from_slice(&[
+        ffmpeg_exe.clone(),
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(), "info".to_string(),
+        "-fflags".to_string(), "+genpts".to_string(),
+        "-avoid_negative_ts".to_string(), "make_zero".to_string(),
+        "-stats".to_string(),
+        "-progress".to_string(), "pipe:2".to_string(),
+    ]);
+
+    // Input 0: Pipe (Overlay frames)
+    cmd_args.extend_from_slice(&[
+        "-f".to_string(), "image2pipe".to_string(),
+        "-vcodec".to_string(), "png".to_string(),
+        "-video_size".to_string(), format!("{}x{}", w, h),
+        "-pixel_format".to_string(), "rgba".to_string(),
+        "-r".to_string(), fps.to_string(),
+        "-i".to_string(), "-".to_string(),
+    ]);
+
+    let mut current_idx = 1;
+    let bg_start_idx = current_idx;
+    for p in &pre_videos {
+        cmd_args.extend_from_slice(&["-i".to_string(), p.clone()]);
+        current_idx += 1;
+    }
+
+    let audio_start_idx = current_idx;
+    if !audio_paths.is_empty() {
+        for p in &audio_paths {
+            cmd_args.extend_from_slice(&["-i".to_string(), p.clone()]);
+            current_idx += 1;
+        }
+    }
+
+    let filter_ctx = build_filter_complex_content(
+        w, h, fps, fade_s, n, &durations_s, start_s, duration_s, 
+        &pre_videos, &audio_paths, audio_start_idx, bg_start_idx, current_idx, true, is_high_fidelity
+    );
+
+    if pre_videos.is_empty() || filter_ctx.total_bg_s <= 1e-6 {
+        cmd_args.extend_from_slice(&[
+            "-f".to_string(), "lavfi".to_string(),
+            "-i".to_string(), format!("color=c=black:s={}x{}:r={}:d={:.6}", w, h, fps, duration_s),
+        ]);
+    } else if filter_ctx.total_bg_s + 1e-6 < duration_s {
+        let remain = duration_s - filter_ctx.total_bg_s;
+        cmd_args.extend_from_slice(&[
+            "-f".to_string(), "lavfi".to_string(),
+            "-i".to_string(), format!("color=c=black:s={}x{}:r={}:d={:.6}", w, h, fps, remain),
+        ]);
+    }
+
+    let tmp_dir = std::env::temp_dir();
+    let fg_path = tmp_dir.join(format!("filter-stream-{}.ffgraph", &format!("{:x}", md5::compute(filter_ctx.filter_complex.as_bytes()))[..8]));
+    fs::write(&fg_path, &filter_ctx.filter_complex).map_err(|e| e.to_string())?;
+
+    cmd_args.extend_from_slice(&["-/filter_complex".to_string(), fg_path.to_string_lossy().to_string()]);
+    cmd_args.extend_from_slice(&["-map".to_string(), "[vout]".to_string()]);
+    if filter_ctx.have_audio {
+        cmd_args.extend_from_slice(&["-map".to_string(), "[aout]".to_string()]);
+        if chunk_index.is_some() {
+            cmd_args.extend_from_slice(&["-c:a".to_string(), "alac".to_string(), "-ac".to_string(), "2".to_string()]);
+        } else {
+            cmd_args.extend_from_slice(&["-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "320k".to_string(), "-ac".to_string(), "2".to_string()]);
+        }
+    }
+
+    let gop = fps * 2;
+    cmd_args.extend_from_slice(&[
+        "-r".to_string(), fps.to_string(),
+        "-fps_mode".to_string(), "cfr".to_string(),
+        "-g".to_string(), gop.to_string(),
+        "-c:v".to_string(), vcodec
+    ]);
+    if let Some(Some(preset)) = vextra.get("preset") {
+        cmd_args.extend_from_slice(&["-preset".to_string(), preset.clone()]);
+    }
+    cmd_args.extend(vparams);
+    cmd_args.extend_from_slice(&["-t".to_string(), format!("{:.6}", duration_s)]);
+    
+    let out_path_buf = path_utils::normalize_output_path(&out_path);
+    if let Some(parent) = out_path_buf.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    cmd_args.push(out_path_buf.to_string_lossy().to_string());
+
+    let mut command = Command::new(&cmd_args[0]);
+    command.args(&cmd_args[1..]);
+    command.stdin(Stdio::piped());
+    command.stderr(Stdio::piped());
+    configure_command_no_window(&mut command);
+
+    let mut child = command.spawn().map_err(|e| format!("Process spawn failed: {}", e))?;
+    let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+    let export_id_for_thread = export_id.clone();
+    let export_id_for_cleanup = export_id.clone();
+    
+    // Enregistrer le processus pour annulation
+    let process_ref = Arc::new(Mutex::new(Some(child)));
+    {
+        let mut active_exports = ACTIVE_EXPORTS.lock().map_err(|_| "Failed to lock active exports")?;
+        active_exports.insert(export_id.clone(), process_ref.clone());
+    }
+
+    // Spawn monitoring thread
+    let process_ref_for_thread = process_ref.clone();
+    task::spawn(async move {
+        use std::io::Read;
+        let mut reader = BufReader::new(stderr);
+        let mut buffer = [0u8; 4096];
+        let mut line_acc = String::new();
+
+        loop {
+            // Lecture des données disponibles sur stderr sans bloquer indéfiniment
+            match reader.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buffer[..n]);
+                    line_acc.push_str(&s);
+                    
+                    while let Some(pos) = line_acc.find('\n') {
+                        let line = line_acc.drain(..pos + 1).collect::<String>();
+                        if line.contains("time=") || line.contains("out_time_ms=") {
+                            if let Some(time_str) = extract_time_from_ffmpeg_line(&line) {
+                                let current_time_s = parse_ffmpeg_time(&time_str);
+                                let progress = (current_time_s / duration_s * 100.0).min(100.0);
+                                let mut progress_data = serde_json::json!({
+                                    "export_id": export_id_for_thread,
+                                    "progress": progress,
+                                    "current_time": current_time_s,
+                                    "total_time": duration_s
+                                });
+                                if let Some(idx) = chunk_index {
+                                    progress_data["chunk_index"] = serde_json::Value::Number(serde_json::Number::from(idx));
+                                }
+                                let _ = app_handle.emit("export-progress", progress_data);
+                            }
+                        } else if !line.trim().is_empty() && !line.contains("frame=") {
+                            // On ne loggue que les erreurs réelles, pas le progrès frame par frame
+                            println!("[ffmpeg][stderr] {}", line.trim());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(_) => break,
+            }
+
+            // Vérifier si le processus est toujours là
+            {
+                let guard = process_ref_for_thread.lock().unwrap();
+                if guard.is_none() { break; } // Processus tué/annulé
+            }
+        }
+
+        let result = {
+            let mut child_guard = process_ref_for_thread.lock().unwrap();
+            if let Some(child) = child_guard.as_mut() {
+                child.wait()
+            } else {
+                return; // Canceled
+            }
+        };
+
+        match result {
+            Ok(status) if status.success() => {
+                let mut completion_data = serde_json::json!({
+                    "filename": Path::new(&out_path).file_name().unwrap_or_default().to_string_lossy(),
+                    "exportId": export_id_for_thread,
+                    "fullPath": out_path
+                });
+                if let Some(idx) = chunk_index {
+                    completion_data["chunkIndex"] = serde_json::Value::Number(serde_json::Number::from(idx));
+                }
+                let _ = app_handle.emit("export-complete", completion_data);
+            }
+            Ok(status) => {
+                let _ = app_handle.emit("export-error", serde_json::json!({
+                    "export_id": export_id_for_thread,
+                    "error": format!("FFmpeg failed with code {:?}", status.code())
+                }));
+            }
+            Err(e) => {
+                let _ = app_handle.emit("export-error", serde_json::json!({
+                    "export_id": export_id_for_thread,
+                    "error": e.to_string()
+                }));
+            }
+        }
+
+        // Ne pas supprimer de ACTIVE_EXPORTS ici si c'est un streaming.
+        // C'est finish_streaming_export qui s'en chargera pour éviter
+        // que l'export ne disparaisse de la liste d'annulation trop tôt.
+        if chunk_index.is_none() {
+            let mut active_exports = ACTIVE_EXPORTS.lock().unwrap();
+            active_exports.remove(&export_id_for_cleanup);
+        }
+    });
+
+    // Store streaming session (only handle stdin, child stays in ACTIVE_EXPORTS)
+    let mut streams = ACTIVE_STREAMS.lock().map_err(|e| e.to_string())?;
+    streams.insert(export_id, Arc::new(StreamingSession { 
+        stdin: Arc::new(Mutex::new(stdin)) 
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> Result<(), String> {
+    let session = {
+        let streams = ACTIVE_STREAMS.lock().map_err(|e| e.to_string())?;
+        streams.get(&export_id).cloned()
+    };
+
+    if let Some(session) = session {
+        let mut stdin = session.stdin.lock().map_err(|_| "Failed to lock stdin")?;
+        for _ in 0..count {
+            stdin.write_all(&frame_data).map_err(|e| e.to_string())?;
+        }
+        stdin.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    } else {
+        Err("Streaming session not found".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn finish_streaming_export(export_id: String) -> Result<(), String> {
+    let session = {
+        let mut streams = ACTIVE_STREAMS.lock().map_err(|e| e.to_string())?;
+        streams.remove(&export_id)
+    };
+
+    if let Some(session) = session {
+        // En fermant le stdin, on informe FFmpeg de terminer l'encodage
+        let mut stdin_lock = session.stdin.lock().map_err(|_| "Failed to lock stdin for cleanup")?;
+        // On remplace le contenu du Mutex par un dummy ou on laisse le drop s'en occuper
+        // En Rust, dropper le garde du mutex ne ferme pas le stdin, il faut dropper le stdin lui-même.
+        // Mais comme on a retiré la session de la map, et qu'on a le seul Arc restant (probablement),
+        // le drop de session à la fin de cette fonction fera le travail.
+    } else {
+        return Err("Streaming session not found".to_string());
+    }
+
+    // On attend un peu que le monitoring thread finisse (SANS tenir le lock sur streams)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Nettoyage final de la liste des exports actifs
+    let mut active_exports = ACTIVE_EXPORTS.lock().map_err(|_| "Failed to lock active exports")?;
+    active_exports.remove(&export_id);
+
+    Ok(())
 }

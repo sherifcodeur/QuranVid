@@ -177,7 +177,9 @@
 			// Ces valeurs sont réduites pour éviter la saturation mémoire (crash FFmpeg)
 			const minDuration = 10 * 1000; // 10 secondes en ms
 			const maxDuration = 20 * 1000; // 20 secondes en ms
-			CHUNK_DURATION = minDuration + ((chunkSize - 1) / (200 - 1)) * (maxDuration - minDuration);
+			CHUNK_DURATION = Math.round(
+				minDuration + ((chunkSize - 1) / (200 - 1)) * (maxDuration - minDuration)
+			);
 
 			console.log(
 				`Chunk size: ${chunkSize}, Chunk duration: ${CHUNK_DURATION}ms (${CHUNK_DURATION / 1000}s)`
@@ -230,14 +232,10 @@
 		exportEnd: number,
 		totalDuration: number
 	) {
-		// Calculer les chunks en s'arrêtant au prochain fade-out après la durée max
 		const chunkInfo = calculateChunksWithFadeOut(exportStart, exportEnd);
 		const generatedVideoFiles: string[] = [];
 
 		console.log(`Splitting into ${chunkInfo.chunks.length} chunks`);
-		chunkInfo.chunks.forEach((chunk, i) => {
-			console.log(`Chunk ${i + 1}: ${chunk.start} -> ${chunk.end} (${chunk.end - chunk.start}ms)`);
-		});
 
 		// Initialiser l'état
 		emitProgress({
@@ -248,98 +246,92 @@
 			totalTime: totalDuration
 		} as ExportProgress);
 
-		// BOUCLE PIPELINE : On encode le chunk N pendant qu'on génère les images du chunk N+1
-		console.log('=== STARTING PIPELINED CHUNK PROCESSING ===');
-
-		// 1. Initialiser le pipeline avec le premier chunk (génération d'images uniquement)
-		let currentChunkIndex = 0;
-		console.log(`Pipeline Init: Generating images for Chunk ${currentChunkIndex}...`);
-		await createChunkImageFolder(`chunk_${currentChunkIndex}`);
-
-		const firstChunk = chunkInfo.chunks[currentChunkIndex];
-		const firstChunkProgressWeight = 100 / chunkInfo.chunks.length;
-
-		await generateImagesForChunk(
-			currentChunkIndex,
-			firstChunk.start,
-			firstChunk.end,
-			`chunk_${currentChunkIndex}`,
-			chunkInfo.chunks.length,
-			0,
-			firstChunkProgressWeight,
-			false // silent=false pour le tout premier chunk (on veut voir le démarrage)
-		);
-
-		// 2. Boucle principale du pipeline
-		// À chaque itération i :
-		// - On lance l'encodage vidéo du chunk i
-		// - EN MÊME TEMPS, on lance la génération d'images du chunk i+1 (si existe)
-		// - On attend que les DEUX soient finis
-		// - On nettoie les images du chunk i
-
 		for (let i = 0; i < chunkInfo.chunks.length; i++) {
-			console.log(`Pipeline Step ${i}: Encoding Video ${i} + Generating Images ${i + 1}`);
+			const chunk = chunkInfo.chunks[i];
+			const chunkDuration = chunk.end - chunk.start;
+			const nextProgressWeight = 100 / chunkInfo.chunks.length;
+			const baseProgress = i * nextProgressWeight;
 
-			const chunkI = chunkInfo.chunks[i];
-			const chunkImageFolderI = `chunk_${i}`;
-			const chunkActualDurationI = chunkI.end - chunkI.start;
+			console.log(`Processing Chunk ${i}: ${chunk.start} -> ${chunk.end}`);
 
-			// Tâche 1: Encodage vidéo du chunk actuel (Backend)
-			const videoTask = (async () => {
-				// On laisse le backend émettre la progression via les events 'export-progress'
-				const path = await generateVideoForChunk(
-					i,
-					chunkImageFolderI,
-					chunkI.start,
-					chunkActualDurationI
-				);
-				return path;
-			})();
+			// 1. Démarrer FFmpeg pour ce chunk
+			const audios = globalState.getAudioTrack.clips.map(
+				(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
+			);
+			const videos = globalState.getVideoTrack.clips.map(
+				(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
+			);
+			const chunkVideoFileName = `chunk_${i}_video.mp4`;
+			const chunkFinalFilePath = await join(
+				await appDataDir(),
+				ExportService.exportFolder,
+				exportId,
+				chunkVideoFileName
+			);
 
-			// Tâche 2: Génération images du chunk suivant (Frontend)
-			const nextChunkIndex = i + 1;
-			let imageTask = Promise.resolve();
+			const hasCustomClips = globalState.getCustomClipTrack?.clips.some((c: any) => {
+				return (c.startTime! < chunk.end && c.endTime! > chunk.start);
+			}) || false;
 
-			if (nextChunkIndex < chunkInfo.chunks.length) {
-				imageTask = (async () => {
-					const chunkNext = chunkInfo.chunks[nextChunkIndex];
-					const chunkImageFolderNext = `chunk_${nextChunkIndex}`;
-					const nextProgressWeight = 100 / chunkInfo.chunks.length;
-					const nextBaseProgress = nextChunkIndex * nextProgressWeight;
+			const timings = calculateTimingsForRange(chunk.start, chunk.end, !hasCustomClips);
+			
+			// Si Fast Mode, les timings sont simplifiés (start/end), ce qui génère 1 segment par clip -> 1 fade in/out
 
-					await createChunkImageFolder(chunkImageFolderNext);
-					await generateImagesForChunk(
-						nextChunkIndex,
-						chunkNext.start,
-						chunkNext.end,
-						chunkImageFolderNext,
-						chunkInfo.chunks.length,
-						nextBaseProgress,
-						nextBaseProgress + nextProgressWeight,
-						true // silent=true : on génère en background, donc pas de mise à jour de la barre de progression (évite le jitter)
-					);
-				})();
+			try {
+				await invoke('start_streaming_export', {
+					exportId: exportId,
+					outPath: chunkFinalFilePath,
+					timestampsMs: timings.uniqueSorted,
+					targetSize: [exportData!.videoDimensions.width, exportData!.videoDimensions.height],
+					fps: exportData!.fps,
+					fadeDurationMs: Math.round(
+						globalState.getStyle('global', 'fade-duration')!.value as number
+					),
+					startTimeMs: Math.round(chunk.start),
+					audioPaths: audios,
+					bgVideos: videos,
+					preferHw: true,
+					durationMs: Math.round(chunkDuration),
+					chunkIndex: i,
+					blur: globalState.getStyle('global', 'overlay-blur')!.value as number,
+					isHighFidelity: hasCustomClips
+				});
+			} catch (e: any) {
+				console.error('Error starting export chunk:', e);
+				emitProgress({
+					exportId: Number(exportId),
+					progress: 100,
+					currentState: ExportState.Error,
+					errorLog: JSON.stringify(e, Object.getOwnPropertyNames(e))
+				} as ExportProgress);
+				throw e;
 			}
 
-			// Attendre que les deux tâches soient finies
-			const [videoPath, _] = await Promise.all([videoTask, imageTask]);
+			// 2. Diffuser les images
+			await streamFramesForChunk(
+				i,
+				chunk.start,
+				chunk.end,
+				timings,
+				baseProgress,
+				baseProgress + nextProgressWeight,
+				hasCustomClips
+			);
 
-			generatedVideoFiles.push(videoPath);
-
-			// Nettoyer les images du chunk terminé (i) pour libérer la place
-			// C'est safe car la vidéo i est finie, et on a fini de générer les images i+1
-			await removeChunkImageFolder(chunkImageFolderI);
+			// 3. Finaliser le chunk
+			await invoke('finish_streaming_export', { exportId: exportId });
+			generatedVideoFiles.push(chunkFinalFilePath);
+			console.log(`✅ Chunk ${i} generated via streaming`);
 		}
 
 		// PHASE FINALE: Concaténation
 		console.log('=== FINAL PHASE: Concatenation ===');
-
-		// Combiner toutes les vidéos en une seule
-		console.log('Concatenating all chunk videos:', generatedVideoFiles);
-
-		await concatenateVideos(generatedVideoFiles);
-
-		// Nettoyage final
+		try {
+			await concatenateVideos(generatedVideoFiles);
+		} catch (e) {
+			console.error('Concatenation failed:', e);
+			throw e;
+		}
 		await finalCleanup();
 
 		emitProgress({
@@ -351,185 +343,123 @@
 		} as ExportProgress);
 	}
 
-	async function removeChunkImageFolder(chunkImageFolder: string) {
-		try {
-			const chunkPath = await join(ExportService.exportFolder, exportId, chunkImageFolder);
-			await remove(chunkPath, {
-				baseDir: BaseDirectory.AppData,
-				recursive: true
-			});
-			console.log(`Deleted chunk folder: ${chunkPath}`);
-		} catch (e) {
-			console.warn(`Could not delete chunk folder ${chunkImageFolder}:`, e);
-		}
-	}
-
-	async function createChunkImageFolder(chunkImageFolder: string) {
-		const chunkPath = await join(ExportService.exportFolder, exportId, chunkImageFolder);
-		await mkdir(chunkPath, {
-			baseDir: BaseDirectory.AppData,
-			recursive: true
-		});
-		console.log(`Created chunk folder: ${chunkPath}`);
-	}
-
-	async function generateImagesForChunk(
-		chunkIndex: number,
+	async function streamFramesForChunk(
+		chunkIndex: number | null,
 		chunkStart: number,
 		chunkEnd: number,
-		chunkImageFolder: string,
-		totalChunks: number,
-		phaseStartProgress: number = 0,
-		phaseEndProgress: number = 100,
-		silent: boolean = false
+		timings: any,
+		phaseStartProgress: number,
+		phaseEndProgress: number,
+		isHighFidelity: boolean
 	) {
-		const fadeDuration = Math.round(
-			globalState.getStyle('global', 'fade-duration')!.value as number
-		);
+		console.log(`[Stream] Processing chunk ${chunkIndex} (Mode: ${isHighFidelity ? 'HighFidelity' : 'Fast'})`);
+		const fps = exportData!.fps;
+		const frame_duration_ms = 1000.0 / fps;
 
-		// Calculer les timings pour ce chunk spécifique
-		const chunkTimings = calculateTimingsForRange(chunkStart, chunkEnd);
+		const totalFramesExpected = Math.round(((chunkEnd - chunkStart) / 1000.0) * fps);
+		let framesSent = 0;
 
-		console.log(`Chunk ${chunkIndex}: ${chunkTimings.uniqueSorted.length} screenshots to take`);
+		if (!isHighFidelity) {
+			// ================= MODE RAPIDE (FFmpeg Fades) =================
+			// On force l'opacité 100% car le backend applique les fondus
+			globalState.exportFullOpacity = true;
 
-		let i = 0;
-		let base = 0; // On ne compense plus ici, le backend gère le décalage via le padding ffconcat
+			for (let i = 0; i < timings.uniqueSorted.length; i++) {
+				const timing = timings.uniqueSorted[i];
+				const t_next = i < timings.uniqueSorted.length - 1 ? timings.uniqueSorted[i + 1] : chunkEnd;
+				
+				const dur_ms = Math.max(t_next - timing, 1);
+				const count = Math.round((dur_ms / 1000.0) * fps);
 
-		for (const timing of chunkTimings.uniqueSorted) {
-			// Calculer l'index de l'image dans ce chunk (recommence à 0)
-			const imageIndex = Math.max(Math.round(timing - chunkStart), 0);
+				if (count > 0) {
+					// Capture au milieu du segment pour une image stable
+					const capturePoint = timing + (dur_ms / 2);
+					globalState.getTimelineState.movePreviewTo = capturePoint;
+					globalState.getTimelineState.cursorPosition = capturePoint;
+					await wait(capturePoint);
 
-			// Vérifie si ce timing doit être dupliqué depuis un autre
-			const sourceTimingForDuplication = Array.from(chunkTimings.duplicableTimings.entries()).find(
-				([target, source]) => target === timing // target = timing qui doit être dupliqué
-			)?.[1];
-
-			// Si c'est dupliquable
-			if (sourceTimingForDuplication !== undefined) {
-				// Ce timing peut être dupliqué depuis sourceTimingForDuplication
-				const sourceIndex = Math.max(Math.round(sourceTimingForDuplication - chunkStart), 0);
-				// Prend que un seul screenshot et le duplique
-				await duplicateScreenshot(`${sourceIndex}`, imageIndex, chunkImageFolder);
-			} else if (
-				hasTiming(chunkTimings.blankImgs, timing).hasIt &&
-				hasBlankImg(
-					chunkTimings.imgWithNothingShown,
-					hasTiming(chunkTimings.blankImgs, timing).surah!
-				)
-			) {
-				// Récupérer le numéro de sourate pour ce timing
-				const surahInfo = hasTiming(chunkTimings.blankImgs, timing);
-				console.log(`Duplicating blank image for surah ${surahInfo.surah} at timing ${timing}`);
-
-				await duplicateScreenshot(`blank_${surahInfo.surah}`, imageIndex, chunkImageFolder);
-				console.log('Duplicating screenshot instead of taking new one at', timing);
-			} else {
-				// Important: le +1 sinon le svg de la sourate est le mauvais
-				globalState.getTimelineState.movePreviewTo = timing;
-				globalState.getTimelineState.cursorPosition = timing;
-
-				// si la difference entre timing et celui juste avant est grand, attendre un peu plus
-				await wait(timing);
-
-				await takeScreenshot(`${imageIndex}`, chunkImageFolder);
-
-				// Vérifier si ce timing correspond à une image blank de référence pour une sourate
-				for (const [surahStr, blankTiming] of Object.entries(chunkTimings.imgWithNothingShown)) {
-					if (timing === blankTiming) {
-						// monte de 1 le timing pour avoir le svg correct
-						globalState.getTimelineState.movePreviewTo = timing - 1;
-						globalState.getTimelineState.cursorPosition = timing - 1;
-						await wait(timing - 1);
-						const surahNum = Number(surahStr);
-						console.log(`Creating blank image for surah ${surahNum} at timing ${timing}`);
-						await takeScreenshot(`blank_${surahNum}`);
-						console.log(`Blank image created for surah ${surahNum} at timing ${timing}`);
-						break; // Une seule sourate par timing
+					const bytes = await captureFrameRaw();
+					if (bytes) {
+						await invoke('send_frame', { exportId: exportId, frameData: bytes, count: count });
+						framesSent += count;
 					}
 				}
 
-				console.log(
-					`Chunk ${chunkIndex}: Screenshot taken at timing ${timing} -> image ${imageIndex}`
-				);
-			}
-
-			base += fadeDuration;
-			i++;
-
-			// Progress pour ce chunk dans la phase spécifiée
-			const chunkImageProgress = (i / chunkTimings.uniqueSorted.length) * 100;
-			// Map local 0-100 to [phaseStart, phaseEnd]
-			const globalProgress =
-				phaseStartProgress + (chunkImageProgress * (phaseEndProgress - phaseStartProgress)) / 100;
-
-			if (!silent) {
+				const progress = phaseStartProgress + (i / timings.uniqueSorted.length) * (phaseEndProgress - phaseStartProgress);
 				emitProgress({
 					exportId: Number(exportId),
-					progress: globalProgress,
+					progress: progress,
 					currentState: ExportState.CapturingFrames,
 					currentTime: timing - exportData!.videoStartTime,
 					totalTime: exportData!.videoEndTime - exportData!.videoStartTime
 				} as ExportProgress);
 			}
+			globalState.exportFullOpacity = false;
+		} else {
+			// ================= MODE HAUTE FIDÉLITÉ (Captures 30fps) =================
+			let currentTime = chunkStart;
+			const endTime = chunkEnd;
+			globalState.exportFullOpacity = false;
+			
+			while (currentTime < endTime && framesSent < totalFramesExpected) {
+				const nextTiming = timings.uniqueSorted.find((t: number) => t > currentTime + 1) || endTime;
+				
+				// Vérifier si nous sommes dans une zone de transition (fondus)
+				const isInTransition = timings.transitionZones.some(
+					(zone: any) => currentTime < zone.end && currentTime >= zone.start - 1
+				);
+
+				const isStaticZone = !isInTransition && (nextTiming - currentTime) > (frame_duration_ms * 1.5);
+				
+				if (isStaticZone) {
+					// ZONE STATIQUE : Capture 1 image et répétition
+					const durationToNext = nextTiming - currentTime;
+					let framesToRepeat = Math.floor(durationToNext / frame_duration_ms);
+					framesToRepeat = Math.min(framesToRepeat, totalFramesExpected - framesSent);
+					
+					if (framesToRepeat > 0) {
+						// On se place au milieu du segment statique pour une capture propre
+						const capturePoint = currentTime + (durationToNext / 2);
+						globalState.getTimelineState.movePreviewTo = capturePoint;
+						globalState.getTimelineState.cursorPosition = capturePoint;
+						await wait(capturePoint);
+
+						const bytes = await captureFrameRaw();
+						if (bytes) {
+							await invoke('send_frame', { exportId: exportId, frameData: bytes, count: framesToRepeat });
+							framesSent += framesToRepeat;
+						}
+						currentTime += framesToRepeat * frame_duration_ms;
+					} else {
+						currentTime += frame_duration_ms;
+					}
+				} else {
+					// ZONE DE TRANSITION : Capture photo par photo à 30fps
+					globalState.getTimelineState.movePreviewTo = currentTime;
+					globalState.getTimelineState.cursorPosition = currentTime;
+					await wait(currentTime);
+
+					const bytes = await captureFrameRaw();
+					if (bytes) {
+						await invoke('send_frame', { exportId: exportId, frameData: bytes, count: 1 });
+						framesSent++;
+					}
+					currentTime += frame_duration_ms;
+				}
+
+				// Progrès
+				const progress = phaseStartProgress + (framesSent / totalFramesExpected) * (phaseEndProgress - phaseStartProgress);
+				emitProgress({
+					exportId: Number(exportId),
+					progress: progress,
+					currentState: ExportState.CapturingFrames,
+					currentTime: currentTime - exportData!.videoStartTime,
+					totalTime: exportData!.videoEndTime - exportData!.videoStartTime
+				} as ExportProgress);
+			}
 		}
-	}
 
-	async function generateVideoForChunk(
-		chunkIndex: number,
-		chunkImageFolder: string,
-		chunkStart: number,
-		chunkDuration: number
-	): Promise<string> {
-		const fadeDuration = Math.round(
-			globalState.getStyle('global', 'fade-duration')!.value as number
-		);
-
-		// Récupère le chemin de fichier de tous les audios du projet
-		const audios: string[] = globalState.getAudioTrack.clips.map(
-			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
-		);
-
-		// Récupère le chemin de fichier de toutes les vidéos du projet
-		const videos = globalState.getVideoTrack.clips.map(
-			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
-		);
-
-		const chunkVideoFileName = `chunk_${chunkIndex}_video.mp4`;
-		const chunkFinalFilePath = await join(
-			await appDataDir(),
-			ExportService.exportFolder,
-			exportId,
-			chunkVideoFileName
-		);
-
-		console.log(`Generating video for chunk ${chunkIndex}: ${chunkFinalFilePath}`);
-
-		try {
-			await invoke('export_video', {
-				exportId: exportId,
-				imgsFolder: await join(
-					await appDataDir(),
-					ExportService.exportFolder,
-					exportId,
-					chunkImageFolder
-				),
-				finalFilePath: chunkFinalFilePath,
-				fps: exportData!.fps,
-				fadeDuration: fadeDuration,
-				startTime: Math.round(chunkStart), // Le startTime pour l'audio/vidéo de fond
-				duration: Math.round(chunkDuration),
-				audios: audios,
-				videos: videos,
-				chunkIndex: chunkIndex,
-				blur: globalState.getStyle('global', 'overlay-blur')!.value as number
-			});
-
-			console.log(`✅ Chunk ${chunkIndex} video generated successfully`);
-			return chunkFinalFilePath;
-		} catch (e: any) {
-			console.error(`❌ Error generating chunk ${chunkIndex} video:`, e);
-			throw e;
-		}
+		console.log(`[Stream] Chunk ${chunkIndex} done. Total frames sent: ${framesSent}`);
 	}
 
 	async function concatenateVideos(videoFilePaths: string[]) {
@@ -582,316 +512,44 @@
 	}
 
 	async function handleNormalExport(exportStart: number, exportEnd: number, totalDuration: number) {
-		const fadeDuration = Math.round(
-			globalState.getStyle('global', 'fade-duration')!.value as number
+		// Détection Custom Clips
+		const hasCustomClips = globalState.getCustomClipTrack?.clips.length > 0;
+		const timings = calculateTimingsForRange(exportStart, exportEnd, !hasCustomClips);
+
+		const audios = globalState.getAudioTrack.clips.map(
+			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
+		);
+		const videos = globalState.getVideoTrack.clips.map(
+			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
 		);
 
-		// Calculer tous les timings nécessaires
-		const timings = calculateTimingsForRange(exportStart, exportEnd);
-
-		console.log('Normal export - Timings détectés:', timings.uniqueSorted);
-		console.log(
-			'Image(s) à dupliquer (blank):',
-			timings.blankImgs,
-			'Image choisie:',
-			timings.imgWithNothingShown
-		);
-
-		let i = 0;
-		let base = 0;
-
-		for (const timing of timings.uniqueSorted) {
-			const imageIndex = Math.max(Math.round(timing - exportStart), 0);
-
-			// Vérifier si ce timing peut être dupliqué depuis un autre
-			const sourceTimingForDuplication = Array.from(timings.duplicableTimings.entries()).find(
-				([target, source]) => target === timing
-			)?.[1];
-
-			if (sourceTimingForDuplication !== undefined) {
-				// Ce timing peut être dupliqué depuis sourceTimingForDuplication
-				const sourceIndex = Math.max(Math.round(sourceTimingForDuplication - exportStart), 0);
-				await duplicateScreenshot(`${sourceIndex}`, imageIndex);
-				console.log(
-					`Optimisation - Duplicating screenshot from timing ${sourceTimingForDuplication} (image ${sourceIndex}) to timing ${timing} (image ${imageIndex})`
-				);
-			} else if (
-				hasTiming(timings.blankImgs, timing).hasIt &&
-				hasBlankImg(timings.imgWithNothingShown, hasTiming(timings.blankImgs, timing).surah!)
-			) {
-				// Récupérer le numéro de sourate pour ce timing
-				const surahInfo = hasTiming(timings.blankImgs, timing);
-				console.log(`Duplicating blank image for surah ${surahInfo.surah} at timing ${timing}`);
-
-				await duplicateScreenshot(`blank_${surahInfo.surah}`, imageIndex);
-				console.log('Duplicating screenshot instead of taking new one at', timing);
-			} else {
-				// Important: le +1 sinon le svg de la sourate est le mauvais
-				globalState.getTimelineState.movePreviewTo = timing + 1;
-				globalState.getTimelineState.cursorPosition = timing + 1;
-
-				await wait(timing + 1);
-
-				await takeScreenshot(`${imageIndex}`);
-
-				// Vérifier si ce timing correspond à une image blank de référence pour une sourate
-				for (const [surahStr, blankTiming] of Object.entries(timings.imgWithNothingShown)) {
-					if (timing === blankTiming) {
-						const surahNum = Number(surahStr);
-						console.log(`Creating blank image for surah ${surahNum} at timing ${timing}`);
-						await takeScreenshot(`blank_${surahNum}`);
-						console.log(`Blank image created for surah ${surahNum} at timing ${timing}`);
-						break; // Une seule sourate par timing
-					}
-				}
-
-				console.log(`Normal export: Screenshot taken at timing ${timing} -> image ${imageIndex}`);
-			}
-
-			base += fadeDuration;
-			i++;
-
-			emitProgress({
-				exportId: Number(exportId),
-				progress: (i / timings.uniqueSorted.length) * 100,
-				currentState: ExportState.CapturingFrames,
-				currentTime: timing - exportStart,
-				totalTime: totalDuration
-			} as ExportProgress);
-		}
-
-		await deleteBlankImages();
-
-		// Générer la vidéo normale
-		await generateNormalVideo(exportStart, totalDuration);
-
-		// Nettoyage
-		await finalCleanup();
-	}
-
-	/**
-	 * Analyser l'état des custom clips à un moment donné
-	 * Retourne un identifiant unique basé sur quels custom clips sont visibles
-	 */
-	function getCustomClipStateAt(timing: number): string {
-		const visibleCustomClips: string[] = [];
-
-		for (const ctClip of globalState.getCustomClipTrack?.clips || []) {
-			// @ts-ignore
-			const category = ctClip.category;
-			if (!category) continue;
-
-			const alwaysShow = (category.getStyle('always-show')?.value as number) || 0;
-			// Ignorer les custom texts always visible comme demandé
-			if (alwaysShow) continue;
-
-			const startTime = category.getStyle('time-appearance')?.value as number;
-			const endTime = category.getStyle('time-disappearance')?.value as number;
-			if (startTime == null || endTime == null) continue;
-
-			// Vérifier si ce custom text est visible au timing donné (inclusive des bornes)
-			if (timing >= startTime && timing <= endTime) {
-				// Créer une clé unique basée sur l'ID du clip et ses propriétés temporelles
-				const uniqueKey = `${ctClip.id}-${startTime}-${endTime}`;
-				visibleCustomClips.push(uniqueKey);
-			}
-		}
-
-		// Retourner un hash des custom texts visibles, triés pour la cohérence
-		const stateSignature = visibleCustomClips.sort().join('|');
-		return stateSignature;
-	}
-
-	function calculateTimingsForRange(rangeStart: number, rangeEnd: number) {
-		const fadeDuration = Math.round(
-			globalState.getStyle('global', 'fade-duration')!.value as number
-		);
-
-		let timingsToTakeScreenshots: number[] = [rangeStart, rangeEnd];
-		let imgWithNothingShown: { [surah: number]: number } = {}; // Timing où rien n'est affiché (pour dupliquer)
-		let blankImgs: {
-			[surah: number]: number[];
-		} = {};
-		// Map pour stocker les timings qui peuvent être dupliqués
-		let duplicableTimings: Map<number, number> = new Map(); // source -> target
-
-		function add(t: number | undefined) {
-			if (t === undefined) return;
-			if (t < rangeStart || t > rangeEnd) return;
-			timingsToTakeScreenshots.push(Math.round(t));
-		}
-
-		// --- Sous-titres ---
-		for (const clip of globalState.getSubtitleTrack.clips) {
-			const { startTime, endTime } = clip as any;
-			if (startTime == null || endTime == null) continue;
-			if (endTime < rangeStart || startTime > rangeEnd) continue;
-			const duration = endTime - startTime;
-			if (duration <= 0) continue;
-
-			if (!(clip instanceof SilenceClip)) {
-				console.log('Processing subtitle clip:', clip);
-				const fadeInEnd = Math.min(startTime + fadeDuration, endTime);
-				const fadeOutStart = endTime - fadeDuration;
-
-				// Vérifier si on peut optimiser les captures pour ce sous-titre
-				// L'idée : si les custom clips visibles sont identiques entre fadeInEnd et fadeOutStart,
-				// on peut prendre une seule capture et la dupliquer, économisant du temps
-				if (fadeOutStart > startTime && fadeInEnd !== fadeOutStart) {
-					// Récupère les customs clips visibles aux deux timings pour voir si possibilité de duplication
-					const customClipStateAtFadeInEnd = getCustomClipStateAt(fadeInEnd);
-					const customClipStateAtFadeOutStart = getCustomClipStateAt(fadeOutStart);
-
-					// Si l'état des custom clips est identique, on peut dupliquer
-					if (customClipStateAtFadeInEnd === customClipStateAtFadeOutStart) {
-						add(fadeInEnd);
-						// Ajoute à la map de duplication
-						duplicableTimings.set(Math.round(fadeOutStart), Math.round(fadeInEnd));
-					} else {
-						// États différents, prendre les deux captures
-						add(fadeInEnd);
-						add(fadeOutStart);
-					}
-				} else {
-					add(fadeInEnd);
-					if (fadeOutStart > startTime) add(fadeOutStart);
-				}
-
-				add(endTime);
-			} else {
-				console.log('Silence clip detected, skipping fade-in/out timings.');
-
-				if (
-					imgWithNothingShown[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)] ===
-					undefined
-				) {
-					add(endTime);
-				} else {
-					if (!blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)])
-						blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)] = [];
-
-					blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)].push(
-						Math.round(endTime)
-					);
-				}
-			}
-
-			if (
-				!globalState.getCustomClipTrack?.clips.find((ctClip) => {
-					// @ts-ignore
-					const clip = ctClip as CustomTextClip;
-					const alwaysShow = clip.category!.getStyle('always-show')!.value as boolean;
-
-					if (alwaysShow) {
-						return false;
-					}
-
-					return clip.startTime! <= endTime && clip.endTime! >= endTime;
-				})
-			) {
-				if (
-					imgWithNothingShown[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)] ===
-					undefined
-				) {
-					console.log(
-						'Ajout de limage blank pour sourate ',
-						globalState.getSubtitleTrack.getCurrentSurah(clip.startTime),
-						' au timing ',
-						Math.round(endTime)
-					);
-
-					imgWithNothingShown[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)] =
-						Math.round(endTime);
-				} else {
-					if (!blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)])
-						blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)] = [];
-
-					blankImgs[globalState.getSubtitleTrack.getCurrentSurah(clip.startTime)].push(
-						Math.round(endTime)
-					);
-				}
-			}
-		}
-
-		// --- Custom Texts ---
-		for (const ctClip of globalState.getCustomClipTrack?.clips || []) {
-			// @ts-ignore
-			const category = ctClip.category;
-			if (!category) continue;
-			const alwaysShow = (category.getStyle('always-show')?.value as number) || 0;
-			const startTime = category.getStyle('time-appearance')?.value as number;
-			const endTime = category.getStyle('time-disappearance')?.value as number;
-			if (startTime == null || endTime == null) continue;
-			if (endTime < rangeStart || startTime > rangeEnd) continue;
-			const duration = endTime - startTime;
-			if (duration <= 0) continue;
-
-			if (alwaysShow) {
-				add(startTime);
-				add(endTime);
-				continue;
-			}
-
-			const ctFadeInEnd = Math.min(startTime + fadeDuration, endTime);
-			add(ctFadeInEnd);
-
-			const ctFadeOutStart = endTime - fadeDuration;
-			if (ctFadeOutStart > startTime) add(ctFadeOutStart);
-
-			add(endTime);
-		}
-
-		const uniqueSorted = Array.from(new Set(timingsToTakeScreenshots))
-			.filter((t) => t >= rangeStart && t <= rangeEnd)
-			.sort((a, b) => a - b);
-
-		console.log(imgWithNothingShown, blankImgs);
-
-		return { uniqueSorted, imgWithNothingShown, blankImgs, duplicableTimings };
-	}
-
-	async function generateNormalVideo(exportStart: number, duration: number) {
 		emitProgress({
 			exportId: Number(exportId),
 			progress: 0,
 			currentState: ExportState.Initializing,
 			currentTime: 0,
-			totalTime: duration
+			totalTime: totalDuration
 		} as ExportProgress);
 
-		const fadeDuration = Math.round(
-			globalState.getStyle('global', 'fade-duration')!.value as number
-		);
-
-		// Récupère le chemin de fichier de tous les audios du projet
-		const audios: string[] = globalState.getAudioTrack.clips.map(
-			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
-		);
-
-		// Récupère le chemin de fichier de toutes les vidéos du projet
-		const videos = globalState.getVideoTrack.clips.map(
-			(clip: any) => globalState.currentProject!.content.getAssetById(clip.assetId).filePath
-		);
-
-		console.log(exportData!.finalFilePath);
-
-		// Supprimer les images blanks avant l'export vidéo
-		await deleteBlankImages();
-
 		try {
-			await invoke('export_video', {
+			await invoke('start_streaming_export', {
 				exportId: exportId,
-				imgsFolder: await join(await appDataDir(), ExportService.exportFolder, exportId),
-				finalFilePath: exportData!.finalFilePath,
+				outPath: exportData!.finalFilePath,
+				timestampsMs: timings.uniqueSorted,
+				targetSize: [exportData!.videoDimensions.width, exportData!.videoDimensions.height],
 				fps: exportData!.fps,
-				fadeDuration: fadeDuration,
-				startTime: exportStart,
-				duration: Math.round(duration),
-				audios: audios,
-				videos: videos,
-				blur: globalState.getStyle('global', 'overlay-blur')!.value as number
+				fadeDurationMs: Math.round(globalState.getStyle('global', 'fade-duration')!.value as number),
+				startTimeMs: Math.round(exportStart),
+				audioPaths: audios,
+				bgVideos: videos,
+				preferHw: true,
+				durationMs: Math.round(totalDuration),
+				chunkIndex: null,
+				blur: globalState.getStyle('global', 'overlay-blur')!.value as number,
+				isHighFidelity: globalState.getCustomClipTrack?.clips.length > 0
 			});
 		} catch (e: any) {
+			console.error('Error starting normal export:', e);
 			emitProgress({
 				exportId: Number(exportId),
 				progress: 100,
@@ -900,262 +558,241 @@
 			} as ExportProgress);
 			throw e;
 		}
+
+		await streamFramesForChunk(null, exportStart, exportEnd, timings, 0, 100, globalState.getCustomClipTrack?.clips.length > 0);
+
+		await invoke('finish_streaming_export', { exportId: exportId });
+		await finalCleanup();
 	}
 
 	async function finalCleanup() {
 		try {
-			// Supprime le dossier temporaire des images
 			await remove(await join(ExportService.exportFolder, exportId), {
 				baseDir: BaseDirectory.AppData,
 				recursive: true
 			});
-
 			console.log('Temporary images folder removed.');
 		} catch (e) {
 			console.warn('Could not remove temporary folder:', e);
 		}
-
-		// Ferme la fenêtre d'export
 		getCurrentWebviewWindow().close();
 	}
 
-	async function takeScreenshot(fileName: string, subfolder: string | null = null) {
-		// L'élément à transformer en image
+	async function captureFrameRaw(): Promise<Uint8Array | null> {
 		let node = document.getElementById('overlay')!;
-
-		// Qualité de l'image
-		let scale = 1.0;
-
-		// En sachant que node.clientWidth = 1920 et node.clientHeight = 1080,
-		// je veux pouvoir avoir la dimension trouvée dans les paramètres d'export
+		if (!node) {
+			console.error('[Capture] Overlay node not found');
+			return null;
+		}
 		const targetWidth = exportData!.videoDimensions.width;
 		const targetHeight = exportData!.videoDimensions.height;
-
-		// Calcul du scale
-		const scaleX = targetWidth / node.clientWidth;
-		const scaleY = targetHeight / node.clientHeight;
-		scale = Math.min(scaleX, scaleY);
-
-		// Utilisation de DomToImage pour transformer la div en image avec timeout
+		const scale = Math.min(targetWidth / node.clientWidth, targetHeight / node.clientHeight);
 		try {
-			// Timeout de 10 secondes pour éviter le blocage indéfini
-			const screenshotPromise = DomToImage.toPng(node, {
-				width: node.clientWidth * scale,
-				height: node.clientHeight * scale,
-				style: {
-					// Set de la qualité
-					transform: 'scale(' + scale + ')',
-					transformOrigin: 'top left'
-				}
-			});
-
-			const timeoutPromise = new Promise((_, reject) =>
-				setTimeout(() => reject(new Error('DomToImage timeout (10s)')), 10000)
-			);
-
-			const dataUrl = (await Promise.race([screenshotPromise, timeoutPromise])) as string;
-
-			// Si on est en mode portrait, on crop pour avoir un ratio 9:16
-			let finalDataUrl = dataUrl;
-
-			// Déterminer le chemin du fichier
-			const pathComponents = [ExportService.exportFolder, exportId];
-			if (subfolder) pathComponents.push(subfolder);
-			pathComponents.push(fileName + '.png');
-
-			const filePathWithName = await join(...pathComponents);
-
-			// Convertir dataUrl base64 en Uint8Array de manière plus efficace
-			const response = await fetch(finalDataUrl);
+			const dataUrl = (await Promise.race([
+				DomToImage.toPng(node, {
+					width: node.clientWidth * scale,
+					height: node.clientHeight * scale,
+					style: { transform: 'scale(' + scale + ')', transformOrigin: 'top left' }
+				}),
+				new Promise((_, reject) =>
+					setTimeout(() => reject(new Error('DomToImage timeout (10s)')), 10000)
+				)
+			])) as string;
+			const response = await fetch(dataUrl);
 			const bytes = new Uint8Array(await response.arrayBuffer());
-
-			await writeFile(filePathWithName, bytes, { baseDir: BaseDirectory.AppData });
-			console.log('Screenshot saved to:', filePathWithName);
-		} catch (error: any) {
-			console.error('Error while taking screenshot: ', error);
-			toast.error('Error while taking screenshot: ' + error.message);
-		}
-	}
-
-	/**
-	 * Duplique un screenshot existant vers un nouveau fichier
-	 * @param sourceFileName Le nom du fichier source (sans extension)
-	 * @param targetFileName Le nom du fichier cible (sans extension)
-	 * @param subfolder Le sous-dossier où se trouvent les fichiers (optionnel)
-	 */
-	async function duplicateScreenshot(
-		sourceFileName: string | number,
-		targetFileName: number,
-		subfolder: string | null = null
-	) {
-		// Construire les chemins source et cible
-		const sourcePathComponents = [ExportService.exportFolder, exportId];
-		const targetPathComponents = [ExportService.exportFolder, exportId];
-
-		if (subfolder) {
-			if (!sourceFileName.toString().includes('blank')) sourcePathComponents.push(subfolder);
-			targetPathComponents.push(subfolder);
-		}
-
-		sourcePathComponents.push(sourceFileName + '.png');
-		targetPathComponents.push(targetFileName + '.png');
-
-		const sourceFilePathWithName = await join(...sourcePathComponents);
-		const targetFilePathWithName = await join(...targetPathComponents);
-
-		// Vérifie que le fichier source existe
-		if (!(await exists(sourceFilePathWithName, { baseDir: BaseDirectory.AppData }))) {
-			console.error('Source screenshot does not exist:', sourceFilePathWithName);
-			return;
-		}
-
-		// Lit le fichier source
-		const data = await readFile(sourceFilePathWithName, { baseDir: BaseDirectory.AppData });
-		// Écrit le fichier cible
-		await writeFile(targetFilePathWithName, data, { baseDir: BaseDirectory.AppData });
-		console.log('Duplicate screenshot saved to:', targetFilePathWithName);
-	}
-
-	/**
-	 * Supprime toutes les images blanks (blank_xxx.png) du dossier spécifié
-	 * @param subfolder Le sous-dossier où supprimer les images blanks (optionnel)
-	 */
-	async function deleteBlankImages() {
-		try {
-			// Construire le chemin du dossier
-			const pathComponents = [ExportService.exportFolder, exportId];
-
-			// Parcourir tous les fichiers pour trouver les images blank_
-			// On utilise une approche simple en testant les numéros de sourate de 1 à 114
-			for (let surahNum = 1; surahNum <= 114; surahNum++) {
-				const blankFileName = `blank_${surahNum}.png`;
-				const blankFilePath = await join(...pathComponents, blankFileName);
-
-				// Vérifier si le fichier existe et le supprimer
-				if (await exists(blankFilePath, { baseDir: BaseDirectory.AppData })) {
-					await remove(blankFilePath, { baseDir: BaseDirectory.AppData });
-					console.log(`Deleted blank image: ${blankFileName}`);
-				}
-			}
+			return bytes;
 		} catch (error) {
-			console.warn('Error deleting blank images:', error);
+			console.error('[Capture] Error while capturing frame: ', error);
+			return null;
 		}
 	}
 
-	function calculateChunksWithFadeOut(exportStart: number, exportEnd: number) {
+	function getCustomClipStateAt(timing: number): string {
+		const visibleCustomClips: string[] = [];
+		for (const ctClip of globalState.getCustomClipTrack?.clips || []) {
+			const category = (ctClip as any).category;
+			if (!category) continue;
+			const alwaysShow = (category.getStyle('always-show')?.value as number) || 0;
+			if (alwaysShow) continue;
+			const startTime = category.getStyle('time-appearance')?.value as number;
+			const endTime = category.getStyle('time-disappearance')?.value as number;
+			if (startTime == null || endTime == null) continue;
+			if (timing >= startTime && timing <= endTime) {
+				visibleCustomClips.push(`${ctClip.id}-${startTime}-${endTime}`);
+			}
+		}
+		return visibleCustomClips.sort().join('|');
+	}
+
+	function calculateTimingsForRange(rangeStart: number, rangeEnd: number, fastMode: boolean = false) {
 		const fadeDuration = Math.round(
 			globalState.getStyle('global', 'fade-duration')!.value as number
 		);
+		let timingsToTakeScreenshots: number[] = [Math.round(rangeStart), Math.round(rangeEnd)];
+		let imgWithNothingShown: { [surah: number]: number } = {};
+		let blankImgs: { [surah: number]: number[] } = {};
+		let duplicableTimings: Map<number, number> = new Map();
+		let transitionZones: Array<{ start: number; end: number }> = [];
 
-		// Collecter tous les moments de fin de fade-out
-		const fadeOutEndTimes: number[] = [];
+		function add(t: number | undefined) {
+			if (t === undefined) return;
+			if (t < rangeStart || t > rangeEnd) return;
+			timingsToTakeScreenshots.push(Math.round(t));
+		}
 
-		// --- Sous-titres ---
+		function addTransition(s: number, e: number) {
+			if (e <= s) return;
+			if (e < rangeStart || s > rangeEnd) return;
+			transitionZones.push({ start: Math.max(rangeStart, s), end: Math.min(rangeEnd, e) });
+		}
+
 		for (const clip of globalState.getSubtitleTrack.clips) {
-			// @ts-ignore
 			const { startTime, endTime } = clip as any;
 			if (startTime == null || endTime == null) continue;
-			if (endTime < exportStart || startTime > exportEnd) continue;
+			if (endTime < rangeStart || startTime > rangeEnd) continue;
+			const duration = endTime - startTime;
+			if (duration <= 0) continue;
 
-			if (!(clip instanceof SilenceClip)) {
-				// Fin de fade-out = endTime (moment où le fade-out se termine)
-				fadeOutEndTimes.push(endTime);
+			if (!(clip instanceof SilenceClip) && clip.type !== 'Silence') {
+				if (fastMode) {
+					// En mode rapide, on ne veut QUE le début et la fin pour avoir 1 seul segment
+					add(startTime);
+					add(endTime);
+				} else {
+					const fadeInEnd = Math.min(startTime + fadeDuration, endTime);
+					const fadeOutStart = endTime - fadeDuration;
+	
+					add(startTime);
+					add(fadeInEnd);
+					addTransition(startTime, fadeInEnd);
+	
+					if (fadeOutStart > startTime) {
+						add(fadeOutStart);
+						add(endTime);
+						addTransition(fadeOutStart, endTime);
+	
+						if (fadeInEnd < fadeOutStart) {
+							if (getCustomClipStateAt(fadeInEnd) === getCustomClipStateAt(fadeOutStart)) {
+								duplicableTimings.set(Math.round(fadeOutStart), Math.round(fadeInEnd));
+							}
+						}
+					} else {
+						add(endTime);
+					}
+				}
+			} else {
+				const surah = globalState.getSubtitleTrack.getCurrentSurah(clip.startTime);
+				if (imgWithNothingShown[surah] === undefined) {
+					add(endTime);
+				} else {
+					if (!blankImgs[surah]) blankImgs[surah] = [];
+					blankImgs[surah].push(Math.round(endTime));
+				}
 			}
 		}
 
-		// --- Custom Texts ---
 		for (const ctClip of globalState.getCustomClipTrack?.clips || []) {
-			// @ts-ignore
-			const category = ctClip.category;
+			const category = (ctClip as any).category;
+			if (!category) continue;
+			const alwaysShow = (category.getStyle('always-show')?.value as number) || 0;
+			const startTime = category.getStyle('time-appearance')?.value as number;
+			const endTime = category.getStyle('time-disappearance')?.value as number;
+			if (startTime == null || endTime == null) continue;
+			if (endTime < rangeStart || startTime > rangeEnd) continue;
+
+			if (alwaysShow) {
+				add(startTime);
+				add(endTime);
+				continue;
+			}
+
+			const ctFadeInEnd = Math.min(startTime + fadeDuration, endTime);
+			add(startTime);
+			add(ctFadeInEnd);
+			addTransition(startTime, ctFadeInEnd);
+
+			const ctFadeOutStart = endTime - fadeDuration;
+			if (ctFadeOutStart > startTime) {
+				add(ctFadeOutStart);
+				add(endTime);
+				addTransition(ctFadeOutStart, endTime);
+			} else {
+				add(endTime);
+			}
+		}
+
+		const uniqueSorted = Array.from(new Set(timingsToTakeScreenshots))
+			.filter((t) => t >= rangeStart && t <= rangeEnd)
+			.sort((a, b) => a - b);
+
+		return { uniqueSorted, imgWithNothingShown, blankImgs, duplicableTimings, transitionZones };
+	}
+
+	function calculateChunksWithFadeOut(exportStart: number, exportEnd: number) {
+		const fadeOutEndTimes: number[] = [];
+		for (const clip of globalState.getSubtitleTrack.clips) {
+			const { startTime, endTime } = clip as any;
+			if (startTime == null || endTime == null) continue;
+			if (endTime < exportStart || startTime > exportEnd) continue;
+			if (!(clip instanceof SilenceClip)) {
+				fadeOutEndTimes.push(endTime);
+			}
+		}
+		for (const ctClip of globalState.getCustomClipTrack?.clips || []) {
+			const category = (ctClip as any).category;
 			if (!category) continue;
 			const alwaysShow = (category.getStyle('always-show')?.value as number) || 0;
 			const startTime = category.getStyle('time-appearance')?.value as number;
 			const endTime = category.getStyle('time-disappearance')?.value as number;
 			if (startTime == null || endTime == null) continue;
 			if (endTime < exportStart || startTime > exportEnd) continue;
-
 			if (!alwaysShow) {
-				// Fin de fade-out = endTime
 				fadeOutEndTimes.push(endTime);
 			}
 		}
-
-		// Trier les fins de fade-out et enlever les doublons
 		const sortedFadeOutEnds = Array.from(new Set(fadeOutEndTimes))
 			.filter((time) => time >= exportStart && time <= exportEnd)
 			.sort((a, b) => a - b);
 
-		console.log('Fins de fade-out détectées:', sortedFadeOutEnds);
-
-		// Calculer les chunks
 		const chunks: Array<{ start: number; end: number }> = [];
 		let currentStart = exportStart;
-
 		while (currentStart < exportEnd) {
-			// Calculer la fin idéale du chunk (currentStart + 10 minutes)
 			const idealChunkEnd = currentStart + CHUNK_DURATION;
-
 			if (idealChunkEnd >= exportEnd) {
-				// Le chunk final
-				chunks.push({ start: currentStart, end: exportEnd });
+				chunks.push({ start: Math.round(currentStart), end: Math.round(exportEnd) });
 				break;
 			}
-
-			// Trouver la prochaine fin de fade-out après idealChunkEnd
 			const nextFadeOutEnd = sortedFadeOutEnds.find((time) => time >= idealChunkEnd);
-
 			if (nextFadeOutEnd && nextFadeOutEnd <= exportEnd) {
-				// S'arrêter à cette fin de fade-out
-				chunks.push({ start: currentStart, end: nextFadeOutEnd });
+				chunks.push({ start: Math.round(currentStart), end: Math.round(nextFadeOutEnd) });
 				currentStart = nextFadeOutEnd;
 			} else {
-				// Pas de fade-out trouvé, s'arrêter à la fin idéale ou à la fin totale
 				const chunkEnd = Math.min(idealChunkEnd, exportEnd);
-				chunks.push({ start: currentStart, end: chunkEnd });
+				chunks.push({ start: Math.round(currentStart), end: Math.round(chunkEnd) });
 				currentStart = chunkEnd;
 			}
 		}
-
 		return { chunks, fadeOutEndTimes: sortedFadeOutEnds };
 	}
 
-	/**
-	 * Attendre un peu plus longtemps si le timing est très espacé du précédent (sous-titre long)
-	 * @param timing
-	 * @param i
-	 * @param uniqueSorted
-	 */
 	async function wait(timing: number) {
-		// On attend au moins 2 cycles d'event loop pour laisser Svelte réagir au changement de cursorPosition
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		await new Promise((resolve) => setTimeout(resolve, 0));
-
 		let subtitlesContainer = document.getElementById('subtitles-container');
-
-		// Si pas de container, on attend juste un peu pour la forme
 		if (!subtitlesContainer) {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			return;
 		}
-
 		const startTime = Date.now();
-		const timeout = 1500; // Timeout légèrement augmenté pour les sous-titres complexes
-
+		const timeout = 1500;
 		while (true) {
-			// On ré-interroge le DOM pour avoir la version la plus fraîche du container
 			const container = document.getElementById('subtitles-container');
-
-			// Si le container a disparu ou si l'opacité est enfin à 1, on arrête d'attendre
 			if (!container || container.style.opacity === '1') {
 				break;
 			}
-
 			if (Date.now() - startTime > timeout) {
-				console.warn(`Timeout waiting for subtitles-container at ${timing}ms, proceeding anyway.`);
 				break;
 			}
-
-			// Attente courte avant la prochaine vérification
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 	}
@@ -1167,13 +804,5 @@
 		<div class="hidden">
 			<Timeline />
 		</div>
-
-		<!-- affiche le current timing -->
-		<!-- <div
-			id="export-timing-indicator"
-			class="absolute top-2 left-1/2 -translate-x-1/2 bg-black bg-opacity-50 text-white px-3 py-1 rounded-md text-sm select-none z-[99999]"
-		>
-			{globalState.getTimelineState.cursorPosition}
-		</div> -->
 	</div>
 {/if}
