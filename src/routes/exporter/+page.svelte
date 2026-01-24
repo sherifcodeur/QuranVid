@@ -217,12 +217,17 @@
 
 		console.log(`Export duration: ${totalDuration}ms (${totalDuration / 1000 / 60} minutes)`);
 
-		// Si la durée est supérieure à 10 minutes, on découpe en chunks
-		if (totalDuration > CHUNK_DURATION) {
-			console.log('Duration > 10 minutes, using chunked export');
-			await handleChunkedExport(exportStart, exportEnd, totalDuration);
+		// Détection de la complexité pour ajuster la stratégie
+		const isHighFidelity = globalState.getCustomClipTrack?.clips.length > 0;
+		// Si FastMode, on peut faire de très gros chunks (5min). Si HighFi, on reste prudent (15s).
+		const DYNAMIC_CHUNK_DURATION = isHighFidelity ? 15000 : 300000;
+
+		// Si la durée est supérieure à la durée idéale d'un chunk, on découpe
+		if (totalDuration > DYNAMIC_CHUNK_DURATION) {
+			console.log(`Duration > ${DYNAMIC_CHUNK_DURATION}ms, using chunked export (HiFi: ${isHighFidelity})`);
+			await handleChunkedExport(exportStart, exportEnd, totalDuration, isHighFidelity);
 		} else {
-			console.log('Duration <= 10 minutes, using normal export');
+			console.log('Duration short, using normal export');
 			await handleNormalExport(exportStart, exportEnd, totalDuration);
 		}
 	}
@@ -230,9 +235,10 @@
 	async function handleChunkedExport(
 		exportStart: number,
 		exportEnd: number,
-		totalDuration: number
+		totalDuration: number,
+		isHighFidelity: boolean
 	) {
-		const chunkInfo = calculateChunksWithFadeOut(exportStart, exportEnd);
+		const chunkInfo = calculateChunksWithFadeOut(exportStart, exportEnd, isHighFidelity);
 		const generatedVideoFiles: string[] = [];
 
 		console.log(`Splitting into ${chunkInfo.chunks.length} chunks`);
@@ -332,7 +338,6 @@
 			console.error('Concatenation failed:', e);
 			throw e;
 		}
-		await finalCleanup();
 
 		emitProgress({
 			exportId: Number(exportId),
@@ -341,6 +346,8 @@
 			currentTime: totalDuration,
 			totalTime: totalDuration
 		} as ExportProgress);
+
+		await finalCleanup();
 	}
 
 	async function streamFramesForChunk(
@@ -467,6 +474,7 @@
 
 		try {
 			const finalVideoPath = await invoke('concat_videos', {
+				exportId: exportId,
 				videoPaths: videoFilePaths,
 				outputPath: exportData!.finalFilePath
 			});
@@ -562,6 +570,15 @@
 		await streamFramesForChunk(null, exportStart, exportEnd, timings, 0, 100, globalState.getCustomClipTrack?.clips.length > 0);
 
 		await invoke('finish_streaming_export', { exportId: exportId });
+		
+		emitProgress({
+			exportId: Number(exportId),
+			progress: 100,
+			currentState: ExportState.Exported,
+			currentTime: totalDuration,
+			totalTime: totalDuration
+		} as ExportProgress);
+
 		await finalCleanup();
 	}
 
@@ -728,7 +745,10 @@
 		return { uniqueSorted, imgWithNothingShown, blankImgs, duplicableTimings, transitionZones };
 	}
 
-	function calculateChunksWithFadeOut(exportStart: number, exportEnd: number) {
+	function calculateChunksWithFadeOut(exportStart: number, exportEnd: number, isHighFidelity: boolean) {
+		// En High Fidelity (30fps), on garde des chunks raisonnables (60s) pour éviter de saturer la RAM/VRAM
+		// En Fast Mode, on envoie très peu de frames, donc on peut faire des chunks beaucoup plus longs (5 min)
+		const CHUNK_DURATION = isHighFidelity ? 60000 : 300000;
 		const fadeOutEndTimes: number[] = [];
 		for (const clip of globalState.getSubtitleTrack.clips) {
 			const { startTime, endTime } = clip as any;
@@ -757,7 +777,7 @@
 		const chunks: Array<{ start: number; end: number }> = [];
 		let currentStart = exportStart;
 		while (currentStart < exportEnd) {
-			const idealChunkEnd = currentStart + CHUNK_DURATION;
+			const idealChunkEnd = currentStart + (isHighFidelity ? 60000 : 300000); 
 			if (idealChunkEnd >= exportEnd) {
 				chunks.push({ start: Math.round(currentStart), end: Math.round(exportEnd) });
 				break;

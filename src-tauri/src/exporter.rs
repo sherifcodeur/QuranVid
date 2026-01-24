@@ -1405,6 +1405,7 @@ pub async fn cancel_export(export_id: String) -> Result<String, String> {
     // 2. Tuer le processus
     let mut active_exports = ACTIVE_EXPORTS.lock().map_err(|_| "Failed to lock active exports")?;
     if let Some(process_ref) = active_exports.remove(&export_id) {
+        println!("[cancel_export] Found active process for {}, locking...", export_id);
         let mut child_guard = process_ref.lock().unwrap();
         if let Some(mut child) = child_guard.take() {
             println!("[cancel_export] Suppression forcée du processus FFmpeg {}", export_id);
@@ -1423,6 +1424,7 @@ pub async fn cancel_export(export_id: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn concat_videos(
+    export_id: String,
     video_paths: Vec<String>,
     output_path: String,
 ) -> Result<String, String> {
@@ -1515,25 +1517,73 @@ pub async fn concat_videos(
     
     println!("[concat_videos] Exécution de FFmpeg...");
     
-    let output = cmd.output()
-        .map_err(|e| format!("Erreur exécution FFmpeg: {}", e))?;
+    // Lancement du processus en mode Child pour pouvoir l'annuler
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("Erreur lancement FFmpeg concat: {}", e))?;
+    
+    // Enregistrement dans ACTIVE_EXPORTS
+    let process_ref = Arc::new(Mutex::new(Some(child)));
+    {
+        let mut active_exports = ACTIVE_EXPORTS.lock().map_err(|_| "Failed to lock active exports")?;
+        active_exports.insert(export_id.clone(), process_ref.clone());
+        println!("[concat_videos] Process registered in ACTIVE_EXPORTS with ID: {}", export_id);
+    }
+
+    // Attente de la fin du processus
+    let wait_result = {
+        // On clone la ref pour attendre sans bloquer le lock global ACTIVE_EXPORTS trop longtemps si on devait le garder
+        // Mais ici on a besoin de lock le process_ref specific
+        let mut loop_count = 0;
+        loop {
+            // On vérifie si annulé
+            {
+                let mut guard = process_ref.lock().unwrap();
+                if guard.is_none() {
+                    println!("[concat_videos] Process cancellation detected for {}", export_id);
+                    // Processus annulé et take() par cancel_export
+                    let _ = fs::remove_file(&list_file_path);
+                    return Err("Concaténation annulée par l'utilisateur".to_string());
+                }
+                
+                // Vérifier si fini sans bloquer indéfiniment (polling)
+                match guard.as_mut().unwrap().try_wait() {
+                    Ok(Some(status)) => {
+                        println!("[concat_videos] Process finished with status: {:?}", status);
+                        break Ok(status)
+                    },
+                    Ok(None) => {
+                        loop_count += 1;
+                        if loop_count % 10 == 0 { // Log every 5s
+                             println!("[concat_videos] Still running... ({}s)", (loop_count as f64) * 0.5);
+                        }
+                    }, 
+                    Err(e) => {
+                        println!("[concat_videos] Error polling process: {}", e);
+                        break Err(e)
+                    },
+                }
+            }
+            // Petit sleep pour ne pas burn le CPU
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    };
+
+    // Nettoyage de ACTIVE_EXPORTS
+    {
+        let mut active_exports = ACTIVE_EXPORTS.lock().unwrap();
+        active_exports.remove(&export_id);
+    }
     
     // Nettoyer le fichier temporaire
     let _ = fs::remove_file(&list_file_path);
     
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        
-        println!("[concat_videos] Erreur FFmpeg:");
-        println!("STDOUT: {}", stdout);
-        println!("STDERR: {}", stderr);
-        
-        return Err(format!(
-            "FFmpeg a échoué lors de la concaténation (code: {:?})\nSTDERR: {}",
-            output.status.code(),
-            stderr
-        ));
+    match wait_result {
+        Ok(status) => {
+            if !status.success() {
+                return Err(format!("FFmpeg concat a échoué avec le code {:?}", status.code()));
+            }
+        },
+        Err(e) => return Err(format!("Erreur attente FFmpeg concat: {}", e)),
     }
     
     // Vérifier que le fichier de sortie a été créé
@@ -1567,6 +1617,9 @@ pub async fn start_streaming_export(
     let fade_s = (fade_duration_ms as f64 / 1000.0).max(0.0);
     let n = timestamps_ms.len();
     
+    println!("[start_streaming_export] Start chunk_index={:?} duration_ms={:?} high_fidelity={} bg_videos={}", 
+        chunk_index, duration_ms, is_high_fidelity, bg_videos.len());
+
     let timings = calculate_export_timings(&timestamps_ms, fps, fade_duration_ms, start_time_ms, duration_ms, is_high_fidelity);
     let durations_s = timings.durations_s;
     let start_s = timings.start_s;
