@@ -442,6 +442,7 @@
 <div class="inset-0 absolute" style="" id="overlay">
 	{#if overlaySettings().enable}
 		<div
+			id="overlay-tint-layer"
 			class="absolute inset-0"
 			style="
 					background-color: {overlaySettings().color};

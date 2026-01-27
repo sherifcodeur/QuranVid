@@ -637,7 +637,10 @@
 				DomToImage.toPng(node, {
 					width: node.clientWidth * scale,
 					height: node.clientHeight * scale,
-					style: { transform: 'scale(' + scale + ')', transformOrigin: 'top left' }
+					style: { transform: 'scale(' + scale + ')', transformOrigin: 'top left' },
+                    filter: (node: Node) => {
+                        return (node as Element).id !== 'overlay-tint-layer';
+                    }
 				}),
 				new Promise((_, reject) =>
 					setTimeout(() => reject(new Error('DomToImage timeout (10s)')), 10000)
