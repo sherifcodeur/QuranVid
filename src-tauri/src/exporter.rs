@@ -39,6 +39,9 @@ pub struct WgpuStreamingSession {
     pub renderer: Arc<TokioMutex<crate::renderer::Renderer>>,
     pub decoder: Arc<TokioMutex<crate::renderer::VideoDecoder>>,
     pub encoder: Arc<TokioMutex<crate::renderer::VideoEncoder>>,
+    pub fade_duration_ms: u32,
+    pub fps: u32,
+    pub is_high_fidelity: bool,
 }
 
 static WGPU_STREAMS: LazyLock<Mutex<HashMap<String, Arc<WgpuStreamingSession>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1628,6 +1631,9 @@ pub async fn start_streaming_export(
         renderer: Arc::new(TokioMutex::new(renderer)),
         decoder: Arc::new(TokioMutex::new(decoder)),
         encoder: Arc::new(TokioMutex::new(encoder)),
+        fade_duration_ms: fade_duration_ms as u32,
+        fps: fps as u32,
+        is_high_fidelity,
     });
 
     WGPU_STREAMS.lock().unwrap().insert(export_id, session);
@@ -1656,7 +1662,9 @@ pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> R
         return Err("Failed to decode subtitle PNG data".to_string());
     }
 
-    for _ in 0..count {
+    let fade_frames = (session.fade_duration_ms as f32 / 1000.0 * session.fps as f32) as u32;
+
+    for i in 0..count {
         // Read background frame
         let bg_raw = match decoder.read_frame() {
             Ok(f) => f,
@@ -1666,10 +1674,18 @@ pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> R
 
         renderer.upload_background(&bg_raw);
         
-        // Render composite (we use alpha 1.0 here because frontend handles local fades if needed, 
-        // or we could calculate if we had timestamps. But standard send_frame usually sends 
-        // prepared overlay frames).
-        renderer.render_image(1.0);
+        // Calculate alpha for fade if not High Fidelity
+        let alpha = if session.is_high_fidelity {
+            1.0 // In High Fidelity, alpha is already baked into the PNG by the frontend
+        } else if fade_frames > 0 {
+            let fade_in = i as f32 / fade_frames as f32;
+            let fade_out = (count.saturating_sub(1).saturating_sub(i)) as f32 / fade_frames as f32;
+            fade_in.min(fade_out).min(1.0)
+        } else {
+            1.0
+        };
+
+        renderer.render_image(alpha);
 
         // Readback
         let frame_out = renderer.read_frame().await.map_err(|e| e.to_string())?;
