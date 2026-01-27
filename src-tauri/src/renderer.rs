@@ -59,15 +59,27 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn new(path: &str, width: u32, height: u32, fps: u32) -> Result<Self, String> {
-        let ffmpeg_exe = "ffmpeg"; // Or use resolve_binary logic here
+        let ffmpeg_exe = "ffmpeg"; 
         
         let mut cmd = Command::new(ffmpeg_exe);
+        
+        if path.starts_with("synthetic:") {
+            // Support for solid color background via lavfi
+            // Format: synthetic:black or synthetic:#RRGGBB
+            let color = path.strip_prefix("synthetic:").unwrap_or("black");
+            cmd.args(&[
+                "-f", "lavfi",
+                "-i", &format!("color=c={}:s={}x{}:r={}", color, width, height, fps),
+            ]);
+        } else {
+            cmd.args(&["-i", path]);
+        }
+
         cmd.args(&[
-            "-i", path,
             "-f", "image2pipe",
-            "-pix_fmt", "rgba", // WGPU compatible format
+            "-pix_fmt", "rgba", 
             "-vcodec", "rawvideo",
-            "-r", &fps.to_string(), // Ensure frame rate match
+            "-r", &fps.to_string(), 
             "-",
         ]);
         

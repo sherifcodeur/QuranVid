@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use tokio::sync::Mutex as TokioMutex;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -32,14 +33,15 @@ fn should_prefer_hw_encoding() -> bool {
 // Gestionnaire des processus actifs pour pouvoir les annuler
 static ACTIVE_EXPORTS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Option<std::process::Child>>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-// Structure pour gérer un export en flux direct (streaming)
-struct StreamingSession {
-    stdin: Arc<Mutex<std::process::ChildStdin>>,
+// Gestionnaire des sessions de streaming actives
+
+pub struct WgpuStreamingSession {
+    pub renderer: Arc<TokioMutex<crate::renderer::Renderer>>,
+    pub decoder: Arc<TokioMutex<crate::renderer::VideoDecoder>>,
+    pub encoder: Arc<TokioMutex<crate::renderer::VideoEncoder>>,
 }
 
-// Gestionnaire des sessions de streaming actives
-static ACTIVE_STREAMS: LazyLock<Mutex<HashMap<String, Arc<StreamingSession>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
+static WGPU_STREAMS: LazyLock<Mutex<HashMap<String, Arc<WgpuStreamingSession>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 // Fonction utilitaire pour configurer les commandes et cacher les fenêtres CMD sur Windows
 fn configure_command_no_window(cmd: &mut Command) {
     #[cfg(target_os = "windows")]
@@ -181,47 +183,35 @@ fn test_nvenc_with_larger_resolution(ffmpeg_path: Option<&str>) -> bool {
     }
 }
 
-fn probe_hw_encoders(ffmpeg_path: Option<&str>) -> Vec<String> {
-    let exe = ffmpeg_path.unwrap_or("ffmpeg");
-    
-    let output = match Command::new(exe)
-        .args(&["-hide_banner", "-encoders"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return Vec::new(),
-    };
-    
-    let txt = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    let mut found = Vec::new();
-    
-    if txt.contains("h264_nvenc") {
-        found.push("h264_nvenc".to_string());
-    }
-    if txt.contains("h264_qsv") {
-        found.push("h264_qsv".to_string());
-    }
-    if txt.contains("h264_amf") {
-        found.push("h264_amf".to_string());
-    }
-    
-    found
-}
-
 fn choose_best_codec(prefer_hw: bool) -> (String, Vec<String>, HashMap<String, Option<String>>) {
     let ffmpeg_exe = resolve_ffmpeg_binary();
-    let hw = if prefer_hw {
-        probe_hw_encoders(ffmpeg_exe.as_deref())
-    } else {
-        Vec::new()
-    };
+    let mut found_hw_encoders = Vec::new();
+
+        if prefer_hw {
+            let exe = ffmpeg_exe.as_deref().unwrap_or("ffmpeg");
+            if let Ok(output) = Command::new(exe)
+                .args(&["-hide_banner", "-encoders"])
+                .output()
+            {
+                let txt = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                if txt.contains("h264_nvenc") {
+                    found_hw_encoders.push("h264_nvenc".to_string());
+                }
+                if txt.contains("h264_qsv") {
+                    found_hw_encoders.push("h264_qsv".to_string());
+                }
+                if txt.contains("h264_amf") {
+                    found_hw_encoders.push("h264_amf".to_string());
+                }
+            }
+        }
     
-    if !hw.is_empty() {
+    if !found_hw_encoders.is_empty() {
         // Tester spécifiquement NVENC s'il est détecté
-        if hw[0] == "h264_nvenc" {
+        if found_hw_encoders[0] == "h264_nvenc" {
             if test_nvenc_availability(ffmpeg_exe.as_deref()) {
                 println!("[codec] Utilisation de NVENC (accélération GPU NVIDIA)");
-                let codec = hw[0].clone();
+                let codec = found_hw_encoders[0].clone();
                 let params = vec![
                     "-pix_fmt".to_string(), "yuv420p".to_string(),
                     "-bf".to_string(), "0".to_string(),
@@ -234,8 +224,8 @@ fn choose_best_codec(prefer_hw: bool) -> (String, Vec<String>, HashMap<String, O
             }
         } else {
             // Pour les autres encodeurs hardware (QSV, AMF), utiliser directement
-            println!("[codec] Utilisation de l'encodeur hardware: {}", hw[0]);
-            let codec = hw[0].clone();
+            println!("[codec] Utilisation de l'encodeur hardware: {}", found_hw_encoders[0]);
+            let codec = found_hw_encoders[0].clone();
             let params = vec!["-pix_fmt".to_string(), "yuv420p".to_string()];
             let mut extra = HashMap::new();
             extra.insert("preset".to_string(), None);
@@ -1290,10 +1280,10 @@ pub async fn export_video(
     let app_handle = app.clone();
     let export_id_clone = export_id.clone();
     
+    let is_high_fidelity = true; // Assuming this is the intended value for the new variable
     start_streaming_export(
         export_id.clone(),
         out_path_str_for_task,
-        imgs_folder_resolved,
         ts,
         target_size,
         fps,
@@ -1305,8 +1295,8 @@ pub async fn export_video(
         duration,
         chunk_index,
         blur,
-        true, // is_high_fidelity
-        app.clone(),
+        is_high_fidelity,
+        app_handle,
     ).await.map_err(|e| format!("WGPU Export error: {}", e))?;
     
     let export_time_s = t0.elapsed().as_secs_f64();
@@ -1389,11 +1379,9 @@ pub async fn cancel_export(export_id: String) -> Result<String, String> {
 
     // 1. Fermer le flux de streaming si il existe
     {
-        let mut streams = ACTIVE_STREAMS.lock().map_err(|e| e.to_string())?;
-        if let Some(_session) = streams.remove(&export_id) {
-            println!("[cancel_export] Fermeture du flux stdin pour {}", export_id);
-            // session est retiré de la map et sera droppé à la fin de ce bloc,
-            // ce qui fermera le stdin si c'était la dernière référence.
+        let mut lock = WGPU_STREAMS.lock().map_err(|e| e.to_string())?;
+        if let Some(_session) = lock.remove(&export_id) {
+            println!("[cancel_export] Fermeture du flux WGPU pour {}", export_id);
         }
     }
 
@@ -1594,7 +1582,6 @@ pub async fn concat_videos(
 pub async fn start_streaming_export(
     export_id: String,
     out_path: String,
-    imgs_folder: String,
     timestamps_ms: Vec<i32>,
     target_size: (i32, i32),
     fps: i32,
@@ -1610,193 +1597,100 @@ pub async fn start_streaming_export(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let (w, h) = target_size;
-    let fade_s = (fade_duration_ms as f64 / 1000.0).max(0.0);
-    // --- WGPU MIGRATION ---
-    // We ignore most of the complex filter logic and use our Rust Renderer.
-    // However, we still need to respect the interface.
     
-    // 1. Setup Renderer
-    let mut renderer = crate::renderer::Renderer::new(w as u32, h as u32).await.map_err(|e| e.to_string())?;
+    // 1. Resolve background video
+    let default_bg = "synthetic:black".to_string();
+    let bg_path = bg_videos.get(0).unwrap_or(&default_bg);
     
-    // 2. Setup Video Decoder (Background)
-    // For now we assume the first background video is the main one. 
-    // If multiple, we would need a playlist logic in Decoder.
-    let bg_path = if !bg_videos.is_empty() {
-        &bg_videos[0]
+    // 2. Setup Renderer, Decoder, Encoder
+    let renderer = crate::renderer::Renderer::new(w as u32, h as u32).await.map_err(|e| e.to_string())?;
+    let decoder = crate::renderer::VideoDecoder::new(bg_path, w as u32, h as u32, fps as u32).map_err(|e| e.to_string())?;
+    
+    // Setup codec and params based on prefer_hw
+    let ffmpeg_bin = resolve_ffmpeg_binary();
+    let (vcodec, vparams, vpreset) = if prefer_hw && test_nvenc_availability(ffmpeg_bin.as_deref()) {
+        ("h264_nvenc", vec!["-rc".to_string(), "vbr".to_string(), "-cq".to_string(), "24".to_string()], Some("p4".to_string()))
     } else {
-        return Err("No background video provided".to_string());
+        ("libx264", vec!["-crf".to_string(), "23".to_string()], Some("medium".to_string()))
     };
-    
-    let mut decoder = crate::renderer::VideoDecoder::new(bg_path, w as u32, h as u32, fps as u32)
-        .map_err(|e| format!("Decoder error: {}", e))?;
-        
-    // 3. Setup Video Encoder (Output) avec codec et audio
-    let (vcodec, vparams, vextra) = choose_best_codec(prefer_hw);
-    let vpreset = vextra.get("preset").and_then(|p| p.clone());
-    
+
     let duration_s = duration_ms.unwrap_or(0) as f64 / 1000.0;
-    let start_s = start_time_ms as f64 / 1000.0;
-
-    let mut encoder = crate::renderer::VideoEncoder::new(
-        &out_path, 
-        w as u32, 
-        h as u32, 
-        fps as u32,
-        &vcodec,
-        vparams,
-        vpreset,
-        &audio_paths,
-        start_s,
+    let encoder = crate::renderer::VideoEncoder::new(
+        &out_path, w as u32, h as u32, fps as u32, 
+        vcodec, vparams, vpreset, 
+        &audio_paths, 
+        start_time_ms as f64 / 1000.0, 
         duration_s
-    ).map_err(|e| format!("Encoder error: {}", e))?;
-        
-    // 4. Register Encoder Child for Cancellation
-    // The encoder.child is the one writing the file, so we track it.
-    {
-         // Small hack: we can't easily clone the child, but we can wrap it if we change the struct.
-         // For now, let's just assume we don't track it in ACTIVE_EXPORTS directly *here* 
-         // because VideoEncoder owns it. 
-         // TODO: Refactor ACTIVE_EXPORTS to hold a CancellationHandle instead of Child process.
-         // For this MVP, if user cancels, we might need a way to stop this loop.
-         // We will check a cancellation flag in the loop?
-    }
+    ).map_err(|e| e.to_string())?;
+
+    // 3. Store in session
+    let session = Arc::new(WgpuStreamingSession {
+        renderer: Arc::new(TokioMutex::new(renderer)),
+        decoder: Arc::new(TokioMutex::new(decoder)),
+        encoder: Arc::new(TokioMutex::new(encoder)),
+    });
+
+    WGPU_STREAMS.lock().unwrap().insert(export_id, session);
     
-    let total_frames = if let Some(d) = duration_ms {
-        (d as f64 / 1000.0 * fps as f64) as usize
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> Result<(), String> {
+    let session = {
+        let lock = WGPU_STREAMS.lock().unwrap();
+        lock.get(&export_id).cloned()
+    }.ok_or("Session not found")?;
+
+    let mut renderer = session.renderer.lock().await;
+    let mut decoder = session.decoder.lock().await;
+    let mut encoder = session.encoder.lock().await;
+
+    // Upload subtitle PNG data (frame_data is the PNG bytes)
+    // Note: This assumes frame_data is a valid PNG image for the subtitle.
+    // If it's raw RGBA, `upload_subtitle` might need adjustment or a different method.
+    if let Ok(img) = image::load_from_memory(&frame_data) {
+        let rgba = img.to_rgba8();
+        renderer.upload_subtitle(&rgba);
     } else {
-        // Fallback or calc from timings
-        100 // dummy
-    };
+        return Err("Failed to decode subtitle PNG data".to_string());
+    }
 
-    let start_inst = std::time::Instant::now();
+    for _ in 0..count {
+        // Read background frame
+        let bg_raw = match decoder.read_frame() {
+            Ok(f) => f,
+            Err(e) if e == "EOF" => break,
+            Err(e) => return Err(e),
+        };
 
-    // 5. Render Loop
-    // Running in a separate task to avoid blocking the main thread? 
-    // Current function is async, so we can just run loop and await.
-    // But VideoEncoder/Decoder are blocking IO for now. Ideally wrap in spawn_blocking.
-    
-    let export_id_clone = export_id.clone();
-    let app_handle_clone = app_handle.clone();
-    
-    tokio::task::spawn_blocking(move || {
-        let mut frame_idx = 0;
-        let mut loop_err = None;
-        let mut last_sub_idx: Option<usize> = None;
+        renderer.upload_background(&bg_raw);
         
-        loop {
-            if frame_idx >= total_frames {
-                break;
-            }
-            
-            // 1. Decode Frame
-            let bg_data = match decoder.read_frame() {
-                Ok(d) => d,
-                Err(e) => {
-                    if e == "EOF" { break; }
-                    loop_err = Some(e);
-                    break;
-                }
-            };
-            
-            // 2. Upload to GPU
-            renderer.upload_background(&bg_data);
-            
-            // 3. Render Subtitle Overlay
-            let time_ms = (frame_idx as f64 / fps as f64 * 1000.0) as i32 + start_time_ms;
-            
-            // Find current subtitle
-            let mut current_sub_idx = None;
-            for (i, &ts) in timestamps_ms.iter().enumerate() {
-                let end = if i + 1 < timestamps_ms.len() { timestamps_ms[i+1] } else { i32::MAX };
-                if time_ms >= ts && time_ms < end {
-                    current_sub_idx = Some(i);
-                    break;
-                }
-            }
+        // Render composite (we use alpha 1.0 here because frontend handles local fades if needed, 
+        // or we could calculate if we had timestamps. But standard send_frame usually sends 
+        // prepared overlay frames).
+        renderer.render_image(1.0);
 
-            if let Some(idx) = current_sub_idx {
-                // Load and upload subtitle texture if changed
-                if last_sub_idx != Some(idx) {
-                    let sub_path = PathBuf::from(&imgs_folder).join(format!("{}.png", idx));
-                    if sub_path.exists() {
-                        if let Ok(img_data) = std::fs::read(sub_path) {
-                            if let Ok(img) = image::load_from_memory(&img_data) {
-                                let rgba = img.to_rgba8();
-                                renderer.upload_subtitle(&rgba);
-                            }
-                        }
-                    }
-                    last_sub_idx = Some(idx);
-                }
+        // Readback
+        let frame_out = renderer.read_frame().await.map_err(|e| e.to_string())?;
 
-                // Calculate Alpha for Fade
-                let start_ms = timestamps_ms[idx];
-                let end_ms = if idx + 1 < timestamps_ms.len() { timestamps_ms[idx+1] } else { timestamps_ms[idx] + 2000 };
-                
-                let mut alpha = 1.0f32;
-                let rel_ms = time_ms - start_ms;
-                let rel_end_ms = end_ms - time_ms;
-                
-                if rel_ms < fade_duration_ms {
-                    alpha = (rel_ms as f32 / fade_duration_ms as f32).min(1.0);
-                } else if rel_end_ms < fade_duration_ms {
-                    alpha = (rel_end_ms as f32 / fade_duration_ms as f32).min(1.0);
-                }
-
-                renderer.render_image(alpha);
-            } else {
-                last_sub_idx = None;
-            }
-            
-            // 4. Readback
-            let frame_out = tokio::runtime::Handle::current().block_on(renderer.read_frame());
-            let frame_out = match frame_out {
-                Ok(f) => f,
-                Err(e) => {
-                    loop_err = Some(e);
-                    break;
-                }
-            };
-            
-            // 5. Encode
-            if let Err(e) = encoder.write_frame(&frame_out) {
-                loop_err = Some(e);
-                break;
-            }
-            
-            // Progress
-            if frame_idx % 30 == 0 {
-                  let _ = app_handle_clone.emit("export-progress", serde_json::json!({
-                    "export_id": export_id_clone,
-                    "progress": (frame_idx as f64 / total_frames as f64) * 100.0,
-                }));
-            }
-            
-            frame_idx += 1;
-        }
-        
-        if let Some(e) = loop_err {
-            let _ = app_handle_clone.emit("export-error", serde_json::json!({ "error": e }));
-        } else {
-             if let Err(e) = encoder.finish() {
-                 let _ = app_handle_clone.emit("export-error", serde_json::json!({ "error": e }));
-             } else {
-                 let _ = app_handle_clone.emit("export-complete", serde_json::json!({ "filename": out_path }));
-             }
-        }
-        
-    }).await.map_err(|e| e.to_string())?;
+        // Encode
+        encoder.write_frame(&frame_out).map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
 
-// Stub for unused functions keeping interface
 #[tauri::command]
-pub async fn send_frame(_export_id: String, _frame_data: Vec<u8>, _count: u32) -> Result<(), String> {
-    Ok(())
-}
+pub async fn finish_streaming_export(export_id: String) -> Result<(), String> {
+    let session = {
+        let mut lock = WGPU_STREAMS.lock().unwrap();
+        lock.remove(&export_id)
+    }.ok_or("Session not found")?;
 
-#[tauri::command]
-pub async fn finish_streaming_export(_export_id: String) -> Result<(), String> {
+    let session = Arc::try_unwrap(session).map_err(|_| "Session still in use")?;
+    let encoder = Arc::try_unwrap(session.encoder).map_err(|_| "Encoder still in use")?.into_inner();
+    encoder.finish().map_err(|e| e.to_string())?;
+
     Ok(())
 }
