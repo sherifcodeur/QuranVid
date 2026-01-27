@@ -37,3 +37,7 @@ md5 = "0.7"
 image = "0.24"
 discord-rich-presence = "0.2"
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+wgpu = "28"
+glyphon = "0.10.0"
+bytemuck = "1.24.0"
+pollster = "0.4.0"

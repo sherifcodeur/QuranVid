@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 mod exporter;
+mod renderer;
 mod binaries;
 mod path_utils;
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
