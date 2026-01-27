@@ -1604,7 +1604,7 @@ pub async fn start_streaming_export(
     
     // 2. Setup Renderer, Decoder, Encoder
     let renderer = crate::renderer::Renderer::new(w as u32, h as u32).await.map_err(|e| e.to_string())?;
-    let decoder = crate::renderer::VideoDecoder::new(bg_path, w as u32, h as u32, fps as u32).map_err(|e| e.to_string())?;
+    let decoder = crate::renderer::VideoDecoder::new(bg_path, w as u32, h as u32, fps as u32, start_time_ms as u32).map_err(|e| e.to_string())?;
     
     // Setup codec and params based on prefer_hw
     let ffmpeg_bin = resolve_ffmpeg_binary();

@@ -58,7 +58,7 @@ pub struct VideoDecoder {
 }
 
 impl VideoDecoder {
-    pub fn new(path: &str, width: u32, height: u32, fps: u32) -> Result<Self, String> {
+    pub fn new(path: &str, width: u32, height: u32, fps: u32, start_time_ms: u32) -> Result<Self, String> {
         let ffmpeg_exe = "ffmpeg"; 
         
         let mut cmd = Command::new(ffmpeg_exe);
@@ -72,6 +72,10 @@ impl VideoDecoder {
                 "-i", &format!("color=c={}:s={}x{}:r={}", color, width, height, fps),
             ]);
         } else {
+            // Seek support: add -ss BEFORE -i for fast input seeking
+            if start_time_ms > 0 {
+                cmd.arg("-ss").arg(format!("{:.3}", start_time_ms as f64 / 1000.0));
+            }
             cmd.args(&["-i", path]);
         }
 
@@ -92,7 +96,7 @@ impl VideoDecoder {
         }
 
         cmd.stdout(Stdio::piped())
-           .stderr(Stdio::piped()); // Capture stderr to avoid buffer filling? Or just null it if not debugging.
+           .stderr(Stdio::null()); // Nullify stderr to prevent stalling when buffer is full
 
         let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn ffmpeg decoder: {}", e))?;
         
@@ -216,7 +220,7 @@ impl VideoEncoder {
 
         command.stdin(Stdio::piped())
                .stdout(Stdio::null())
-               .stderr(Stdio::piped()); // We might want stderr for progress later
+               .stderr(Stdio::null()); // Nullify stderr to prevent stalling when buffer is full
 
         let mut child = command.spawn().map_err(|e| format!("Failed to spawn encoder: {}", e))?;
         let stdin = child.stdin.take().ok_or("Failed to capture encoder stdin")?;
