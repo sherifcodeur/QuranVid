@@ -58,28 +58,67 @@ pub struct VideoDecoder {
 }
 
 impl VideoDecoder {
-    pub fn new(path: &str, width: u32, height: u32, fps: u32, start_time_ms: u32) -> Result<Self, String> {
+    pub fn new(
+        path: &str, 
+        width: u32, 
+        height: u32, 
+        fps: u32, 
+        start_time_ms: u32,
+        blur: f64,
+        overlay_color: &str, 
+        overlay_opacity: f64
+    ) -> Result<Self, String> {
         let ffmpeg_exe = "ffmpeg"; 
         
         let mut cmd = Command::new(ffmpeg_exe);
         
         if path.starts_with("synthetic:") {
             // Support for solid color background via lavfi
-            // Format: synthetic:black or synthetic:#RRGGBB
             let color = path.strip_prefix("synthetic:").unwrap_or("black");
             cmd.args(&[
                 "-f", "lavfi",
                 "-i", &format!("color=c={}:s={}x{}:r={}", color, width, height, fps),
             ]);
         } else {
+            // Detect if it's an image to apply -loop 1
+            let is_image = path.to_lowercase().ends_with(".png") || 
+                           path.to_lowercase().ends_with(".jpg") || 
+                           path.to_lowercase().ends_with(".jpeg") ||
+                           path.to_lowercase().ends_with(".webp");
+
+            if is_image {
+                cmd.arg("-loop").arg("1");
+            }
+
             // Seek support: add -ss BEFORE -i for fast input seeking
-            if start_time_ms > 0 {
+            if !is_image && start_time_ms > 0 {
                 cmd.arg("-ss").arg(format!("{:.3}", start_time_ms as f64 / 1000.0));
             }
             cmd.args(&["-i", path]);
         }
 
+        // 1. Scale and Pad (Letterboxing)
+        let mut filters = format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2", 
+            width, height, width, height
+        );
+
+        // 2. Blur if needed
+        if blur > 0.1 {
+            // Use boxblur for performance. Radius is roughly proportional to blur value.
+            filters.push_str(&format!(",boxblur={}:1", (blur * 10.0) as u32));
+        }
+
+        // 3. Tint (Overlay) if needed
+        if overlay_opacity > 0.01 {
+            // Use drawbox to fill the entire frame with the overlay color
+            // overlay_color is usually like "#000000"
+            let color_with_alpha = format!("{}@{}", overlay_color, overlay_opacity);
+            filters.push_str(&format!(",drawbox=t=fill:c={}", color_with_alpha));
+        }
+
         cmd.args(&[
+            "-vf", &filters,
             "-f", "image2pipe",
             "-pix_fmt", "rgba", 
             "-vcodec", "rawvideo",

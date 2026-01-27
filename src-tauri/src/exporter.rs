@@ -1298,6 +1298,8 @@ pub async fn export_video(
         duration,
         chunk_index,
         blur,
+        None, // overlay_color
+        None, // overlay_opacity
         is_high_fidelity,
         app_handle,
     ).await.map_err(|e| format!("WGPU Export error: {}", e))?;
@@ -1594,10 +1596,12 @@ pub async fn start_streaming_export(
     bg_videos: Vec<String>,
     prefer_hw: bool,
     duration_ms: Option<i32>,
-    chunk_index: Option<i32>,
+    _chunk_index: Option<i32>,
     blur: Option<f64>,
+    overlay_color: Option<String>,
+    overlay_opacity: Option<f64>,
     is_high_fidelity: bool,
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let (w, h) = target_size;
     
@@ -1607,7 +1611,15 @@ pub async fn start_streaming_export(
     
     // 2. Setup Renderer, Decoder, Encoder
     let renderer = crate::renderer::Renderer::new(w as u32, h as u32).await.map_err(|e| e.to_string())?;
-    let decoder = crate::renderer::VideoDecoder::new(bg_path, w as u32, h as u32, fps as u32, start_time_ms as u32).map_err(|e| e.to_string())?;
+    
+    let blur_val = blur.unwrap_or(0.0);
+    let color_val = overlay_color.unwrap_or_else(|| "#000000".to_string());
+    let opacity_val = overlay_opacity.unwrap_or(0.0);
+
+    let decoder = crate::renderer::VideoDecoder::new(
+        bg_path, w as u32, h as u32, fps as u32, start_time_ms as u32,
+        blur_val, &color_val, opacity_val
+    ).map_err(|e| e.to_string())?;
     
     // Setup codec and params based on prefer_hw
     let ffmpeg_bin = resolve_ffmpeg_binary();

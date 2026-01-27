@@ -224,7 +224,9 @@
 
 		// Si la durée est supérieure à la durée idéale d'un chunk, on découpe
 		if (totalDuration > DYNAMIC_CHUNK_DURATION) {
-			console.log(`Duration > ${DYNAMIC_CHUNK_DURATION}ms, using chunked export (HiFi: ${isHighFidelity})`);
+			console.log(
+				`Duration > ${DYNAMIC_CHUNK_DURATION}ms, using chunked export (HiFi: ${isHighFidelity})`
+			);
 			await handleChunkedExport(exportStart, exportEnd, totalDuration, isHighFidelity);
 		} else {
 			console.log('Duration short, using normal export');
@@ -275,12 +277,13 @@
 				chunkVideoFileName
 			);
 
-			const hasCustomClips = globalState.getCustomClipTrack?.clips.some((c: any) => {
-				return (c.startTime! < chunk.end && c.endTime! > chunk.start);
-			}) || false;
+			const hasCustomClips =
+				globalState.getCustomClipTrack?.clips.some((c: any) => {
+					return c.startTime! < chunk.end && c.endTime! > chunk.start;
+				}) || false;
 
 			const timings = calculateTimingsForRange(chunk.start, chunk.end, !hasCustomClips);
-			
+
 			// Si Fast Mode, les timings sont simplifiés (start/end), ce qui génère 1 segment par clip -> 1 fade in/out
 
 			try {
@@ -300,6 +303,9 @@
 					durationMs: Math.round(chunkDuration),
 					chunkIndex: i,
 					blur: globalState.getStyle('global', 'overlay-blur')!.value as number,
+					overlayColor: globalState.getStyle('global', 'overlay-color')!.value as string,
+					overlayOpacity:
+						(globalState.getStyle('global', 'overlay-opacity')!.value as number) / 100,
 					isHighFidelity: hasCustomClips
 				});
 			} catch (e: any) {
@@ -359,7 +365,9 @@
 		phaseEndProgress: number,
 		isHighFidelity: boolean
 	) {
-		console.log(`[Stream] Processing chunk ${chunkIndex} (Mode: ${isHighFidelity ? 'HighFidelity' : 'Fast'})`);
+		console.log(
+			`[Stream] Processing chunk ${chunkIndex} (Mode: ${isHighFidelity ? 'HighFidelity' : 'Fast'})`
+		);
 		const fps = exportData!.fps;
 		const frame_duration_ms = 1000.0 / fps;
 
@@ -374,13 +382,13 @@
 			for (let i = 0; i < timings.uniqueSorted.length; i++) {
 				const timing = timings.uniqueSorted[i];
 				const t_next = i < timings.uniqueSorted.length - 1 ? timings.uniqueSorted[i + 1] : chunkEnd;
-				
+
 				const dur_ms = Math.max(t_next - timing, 1);
 				const count = Math.round((dur_ms / 1000.0) * fps);
 
 				if (count > 0) {
 					// Capture au milieu du segment pour une image stable
-					const capturePoint = timing + (dur_ms / 2);
+					const capturePoint = timing + dur_ms / 2;
 					globalState.getTimelineState.movePreviewTo = capturePoint;
 					globalState.getTimelineState.cursorPosition = capturePoint;
 					await wait(capturePoint);
@@ -392,7 +400,9 @@
 					}
 				}
 
-				const progress = phaseStartProgress + (i / timings.uniqueSorted.length) * (phaseEndProgress - phaseStartProgress);
+				const progress =
+					phaseStartProgress +
+					(i / timings.uniqueSorted.length) * (phaseEndProgress - phaseStartProgress);
 				emitProgress({
 					exportId: Number(exportId),
 					progress: progress,
@@ -407,33 +417,37 @@
 			let currentTime = chunkStart;
 			const endTime = chunkEnd;
 			globalState.exportFullOpacity = false;
-			
+
 			while (currentTime < endTime && framesSent < totalFramesExpected) {
 				const nextTiming = timings.uniqueSorted.find((t: number) => t > currentTime + 1) || endTime;
-				
+
 				// Vérifier si nous sommes dans une zone de transition (fondus)
 				const isInTransition = timings.transitionZones.some(
 					(zone: any) => currentTime < zone.end && currentTime >= zone.start - 1
 				);
 
-				const isStaticZone = !isInTransition && (nextTiming - currentTime) > (frame_duration_ms * 1.5);
-				
+				const isStaticZone = !isInTransition && nextTiming - currentTime > frame_duration_ms * 1.5;
+
 				if (isStaticZone) {
 					// ZONE STATIQUE : Capture 1 image et répétition
 					const durationToNext = nextTiming - currentTime;
 					let framesToRepeat = Math.floor(durationToNext / frame_duration_ms);
 					framesToRepeat = Math.min(framesToRepeat, totalFramesExpected - framesSent);
-					
+
 					if (framesToRepeat > 0) {
 						// On se place au milieu du segment statique pour une capture propre
-						const capturePoint = currentTime + (durationToNext / 2);
+						const capturePoint = currentTime + durationToNext / 2;
 						globalState.getTimelineState.movePreviewTo = capturePoint;
 						globalState.getTimelineState.cursorPosition = capturePoint;
 						await wait(capturePoint);
 
 						const bytes = await captureFrameRaw();
 						if (bytes) {
-							await invoke('send_frame', { exportId: exportId, frameData: bytes, count: framesToRepeat });
+							await invoke('send_frame', {
+								exportId: exportId,
+								frameData: bytes,
+								count: framesToRepeat
+							});
 							framesSent += framesToRepeat;
 						}
 						currentTime += framesToRepeat * frame_duration_ms;
@@ -455,7 +469,9 @@
 				}
 
 				// Progrès
-				const progress = phaseStartProgress + (framesSent / totalFramesExpected) * (phaseEndProgress - phaseStartProgress);
+				const progress =
+					phaseStartProgress +
+					(framesSent / totalFramesExpected) * (phaseEndProgress - phaseStartProgress);
 				emitProgress({
 					exportId: Number(exportId),
 					progress: progress,
@@ -546,7 +562,9 @@
 				timestampsMs: timings.uniqueSorted,
 				targetSize: [exportData!.videoDimensions.width, exportData!.videoDimensions.height],
 				fps: exportData!.fps,
-				fadeDurationMs: Math.round(globalState.getStyle('global', 'fade-duration')!.value as number),
+				fadeDurationMs: Math.round(
+					globalState.getStyle('global', 'fade-duration')!.value as number
+				),
 				startTimeMs: Math.round(exportStart),
 				audioPaths: audios,
 				bgVideos: videos,
@@ -567,10 +585,18 @@
 			throw e;
 		}
 
-		await streamFramesForChunk(null, exportStart, exportEnd, timings, 0, 100, globalState.getCustomClipTrack?.clips.length > 0);
+		await streamFramesForChunk(
+			null,
+			exportStart,
+			exportEnd,
+			timings,
+			0,
+			100,
+			globalState.getCustomClipTrack?.clips.length > 0
+		);
 
 		await invoke('finish_streaming_export', { exportId: exportId });
-		
+
 		emitProgress({
 			exportId: Number(exportId),
 			progress: 100,
@@ -641,7 +667,11 @@
 		return visibleCustomClips.sort().join('|');
 	}
 
-	function calculateTimingsForRange(rangeStart: number, rangeEnd: number, fastMode: boolean = false) {
+	function calculateTimingsForRange(
+		rangeStart: number,
+		rangeEnd: number,
+		fastMode: boolean = false
+	) {
 		const fadeDuration = Math.round(
 			globalState.getStyle('global', 'fade-duration')!.value as number
 		);
@@ -678,16 +708,16 @@
 				} else {
 					const fadeInEnd = Math.min(startTime + fadeDuration, endTime);
 					const fadeOutStart = endTime - fadeDuration;
-	
+
 					add(startTime);
 					add(fadeInEnd);
 					addTransition(startTime, fadeInEnd);
-	
+
 					if (fadeOutStart > startTime) {
 						add(fadeOutStart);
 						add(endTime);
 						addTransition(fadeOutStart, endTime);
-	
+
 						if (fadeInEnd < fadeOutStart) {
 							if (getCustomClipStateAt(fadeInEnd) === getCustomClipStateAt(fadeOutStart)) {
 								duplicableTimings.set(Math.round(fadeOutStart), Math.round(fadeInEnd));
@@ -745,7 +775,11 @@
 		return { uniqueSorted, imgWithNothingShown, blankImgs, duplicableTimings, transitionZones };
 	}
 
-	function calculateChunksWithFadeOut(exportStart: number, exportEnd: number, isHighFidelity: boolean) {
+	function calculateChunksWithFadeOut(
+		exportStart: number,
+		exportEnd: number,
+		isHighFidelity: boolean
+	) {
 		// En High Fidelity (30fps), on garde des chunks raisonnables (60s) pour éviter de saturer la RAM/VRAM
 		// En Fast Mode, on envoie très peu de frames, donc on peut faire des chunks beaucoup plus longs (5 min)
 		const CHUNK_DURATION = isHighFidelity ? 60000 : 300000;
@@ -777,7 +811,7 @@
 		const chunks: Array<{ start: number; end: number }> = [];
 		let currentStart = exportStart;
 		while (currentStart < exportEnd) {
-			const idealChunkEnd = currentStart + (isHighFidelity ? 60000 : 300000); 
+			const idealChunkEnd = currentStart + (isHighFidelity ? 60000 : 300000);
 			if (idealChunkEnd >= exportEnd) {
 				chunks.push({ start: Math.round(currentStart), end: Math.round(exportEnd) });
 				break;
