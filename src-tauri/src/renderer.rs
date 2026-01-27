@@ -552,7 +552,10 @@ pub struct Renderer {
     bg_view: wgpu::TextureView,
     text_renderer: TextRenderer,
     pub output_buffer: wgpu::Buffer,
-    pub image_renderer: ImageRenderer,
+    pub tint_renderer: ImageRenderer, // Renamed/Added for clarity
+    pub tint_texture: wgpu::Texture,
+    pub tint_view: wgpu::TextureView,
+    pub sub_renderer: ImageRenderer,  // Renamed from image_renderer
     pub sub_texture: wgpu::Texture,
     pub sub_view: wgpu::TextureView,
 }
@@ -591,13 +594,26 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: ctx.texture_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let sub_view = sub_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let tint_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Tint Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ctx.texture_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let tint_view = tint_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let text_renderer = TextRenderer::new(&ctx.device, &ctx.queue, ctx.texture_format, width, height);
-        let image_renderer = ImageRenderer::new(&ctx.device, ctx.texture_format);
+        let tint_renderer = ImageRenderer::new(&ctx.device, ctx.texture_format);
+        let sub_renderer = ImageRenderer::new(&ctx.device, ctx.texture_format);
 
         // Buffer for reading back data
         let output_buffer_size = (width * height * 4) as wgpu::BufferAddress;
@@ -617,10 +633,40 @@ impl Renderer {
             bg_view,
             text_renderer,
             output_buffer,
-            image_renderer,
+            tint_renderer,
+            tint_texture,
+            tint_view,
+            sub_renderer,
             sub_texture,
             sub_view,
         })
+    }
+    
+    pub fn update_tint(&self, color_hex: &str) {
+         let r = u8::from_str_radix(&color_hex[1..3], 16).unwrap_or(0);
+         let g = u8::from_str_radix(&color_hex[3..5], 16).unwrap_or(0);
+         let b = u8::from_str_radix(&color_hex[5..7], 16).unwrap_or(0);
+         
+         self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.tint_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[r, g, b, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+    }
+    
+    pub fn prepare_tint(&mut self, color_hex: &str, opacity: f32) {
+        self.update_tint(color_hex);
+        self.tint_renderer.set_alpha(&self.ctx.queue, opacity);
     }
 
     pub fn upload_background(&self, data: &[u8]) {
@@ -645,9 +691,38 @@ impl Renderer {
         );
     }
 
-    pub fn render_image(&mut self, alpha: f32) {
-        self.image_renderer.set_alpha(&self.ctx.queue, alpha);
-        self.image_renderer.render(&self.ctx.device, &self.ctx.queue, &self.bg_view, &self.sub_view);
+    pub fn render_image(&mut self, alpha: f32, overlay_enable: bool, overlay_opacity: f32) {
+        // 1. (Optional) Global Tint Layer
+        if overlay_enable && overlay_opacity > 0.001 {
+            self.tint_renderer.render(&self.ctx.device, &self.ctx.queue, &self.bg_view, &self.tint_view);
+        }
+
+        // 2. Subtitle Layer
+        self.sub_renderer.set_alpha(&self.ctx.queue, alpha);
+        self.sub_renderer.render(&self.ctx.device, &self.ctx.queue, &self.bg_view, &self.sub_view);
+    }
+
+    pub fn clear_subtitle(&self) {
+        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Clear Subtitle") });
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Clear Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.sub_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.ctx.queue.submit(Some(encoder.finish()));
     }
 
     pub fn upload_subtitle(&self, data: &[u8]) {

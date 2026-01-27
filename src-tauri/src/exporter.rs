@@ -42,6 +42,9 @@ pub struct WgpuStreamingSession {
     pub fade_duration_ms: u32,
     pub fps: u32,
     pub is_high_fidelity: bool,
+    pub overlay_enable: bool,
+    pub overlay_color: String,
+    pub overlay_opacity: f32,
 }
 
 static WGPU_STREAMS: LazyLock<Mutex<HashMap<String, Arc<WgpuStreamingSession>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1300,6 +1303,7 @@ pub async fn export_video(
         blur,
         None, // overlay_color
         None, // overlay_opacity
+        None, // overlay_enable
         is_high_fidelity,
         app_handle,
     ).await.map_err(|e| format!("WGPU Export error: {}", e))?;
@@ -1600,6 +1604,7 @@ pub async fn start_streaming_export(
     blur: Option<f64>,
     overlay_color: Option<String>,
     overlay_opacity: Option<f64>,
+    overlay_enable: Option<bool>,
     is_high_fidelity: bool,
     _app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
@@ -1616,9 +1621,18 @@ pub async fn start_streaming_export(
     let color_val = overlay_color.unwrap_or_else(|| "#000000".to_string());
     let opacity_val = overlay_opacity.unwrap_or(0.0);
 
+    println!("[start_streaming_export] Initializing Decoder...");
     let decoder = crate::renderer::VideoDecoder::new(
         bg_path, w as u32, h as u32, fps as u32, start_time_ms as u32,
-        blur_val, &color_val, opacity_val
+        blur_val, 
+        // We do NOT pass overlay info to Decoder anymore (FFmpeg tint removed)
+        // &color_val, opacity_val. 
+        // Update VideoDecoder::new signature in renderer.rs first? 
+        // No, I need to match the signature I see in renderer.rs.
+        // Wait, I haven't updated VideoDecoder::new signature in renderer.rs yet to REMOVE them.
+        // Step 1865 showed VideoDecoder::new TAKES overlay_color/opacity.
+        // I should pass empty/zero to VideoDecoder to disable FFmpeg tint.
+        "", 0.0
     ).map_err(|e| e.to_string())?;
     
     // Setup codec and params based on prefer_hw
@@ -1646,9 +1660,14 @@ pub async fn start_streaming_export(
         fade_duration_ms: fade_duration_ms as u32,
         fps: fps as u32,
         is_high_fidelity,
+        overlay_enable: overlay_enable.unwrap_or(false),
+        overlay_color: color_val,
+        overlay_opacity: opacity_val as f32,
     });
 
+    println!("[start_streaming_export] Storing Session...");
     WGPU_STREAMS.lock().unwrap().insert(export_id, session);
+    println!("[start_streaming_export] ✅ Session started successfully.");
     
     Ok(())
 }
@@ -1674,6 +1693,12 @@ pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> R
         return Err("Failed to decode subtitle PNG data".to_string());
     }
 
+    // Optimization: Prepare the tint layer once for this batch of frames
+    // This updates the 1x1 tint texture and sets the tint renderer's alpha
+    if session.overlay_enable && session.overlay_opacity > 0.001 {
+        renderer.prepare_tint(&session.overlay_color, session.overlay_opacity);
+    }
+
     let fade_frames = (session.fade_duration_ms as f32 / 1000.0 * session.fps as f32) as u32;
 
     for i in 0..count {
@@ -1697,7 +1722,15 @@ pub async fn send_frame(export_id: String, frame_data: Vec<u8>, count: u32) -> R
             1.0
         };
 
-        renderer.render_image(alpha);
+        // 3. Composite everything (3-Layer "Sandwich")
+        // Layer 1: Background (upload_background done above)
+        // Layer 2: Tint (Handled by render_image first pass)
+        // Layer 3: Subtitles (Handled by render_image second pass with dynamic alpha)
+        renderer.render_image(
+            alpha, 
+            session.overlay_enable, 
+            session.overlay_opacity
+        );
 
         // Readback
         let frame_out = renderer.read_frame().await.map_err(|e| e.to_string())?;

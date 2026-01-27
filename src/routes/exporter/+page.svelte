@@ -306,6 +306,7 @@
 					overlayColor: globalState.getStyle('global', 'overlay-color')!.value as string,
 					overlayOpacity:
 						(globalState.getStyle('global', 'overlay-opacity')!.value as number) / 100,
+					overlayEnable: globalState.getStyle('global', 'overlay-enable')!.value as boolean,
 					isHighFidelity: hasCustomClips
 				});
 			} catch (e: any) {
@@ -622,6 +623,7 @@
 	}
 
 	async function captureFrameRaw(): Promise<Uint8Array | null> {
+		console.log('[Capture] Starting captureFrameRaw...');
 		let node = document.getElementById('overlay')!;
 		if (!node) {
 			console.error('[Capture] Overlay node not found');
@@ -641,8 +643,11 @@
 					setTimeout(() => reject(new Error('DomToImage timeout (10s)')), 10000)
 				)
 			])) as string;
+			console.log('[Capture] DomToImage success');
 			const response = await fetch(dataUrl);
-			const bytes = new Uint8Array(await response.arrayBuffer());
+            const arrayBuffer = await response.arrayBuffer();
+			const bytes = new Uint8Array(arrayBuffer);
+            if (bytes.length < 1000) console.warn(`[Capture] Suspiciously small frame: ${bytes.length} bytes`);
 			return bytes;
 		} catch (error) {
 			console.error('[Capture] Error while capturing frame: ', error);
@@ -839,16 +844,20 @@
 		}
 		const startTime = Date.now();
 		const timeout = 1500;
+        let loops = 0;
 		while (true) {
+            loops++;
 			const container = document.getElementById('subtitles-container');
 			if (!container || container.style.opacity === '1') {
 				break;
 			}
 			if (Date.now() - startTime > timeout) {
+                console.warn(`[Wait] Timeout waiting for opacity=1 at ${timing}ms. Current: ${container?.style.opacity}`);
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
+        // console.log(`[Wait] Ready at ${timing}ms after ${loops} loops`);
 	}
 </script>
 
