@@ -99,7 +99,7 @@
 			}}
 		>
 			<img class="text-indigo-400 w-8 pb-0.25" alt="Logo" src="favicon.png" />
-			<h1 class="text-lg font-semibold text-primary pt-0.75">Quran Caption</h1>
+			<h1 class="text-lg font-semibold text-primary pt-0.75">Quran Vid</h1>
 		</button>
 		{#if globalState.currentProject}
 			<button
@@ -227,7 +227,7 @@
 						<iframe
 							class="w-full aspect-video"
 							src="https://www.youtube.com/embed/vCRUjzATRDk"
-							title="Quran Caption Overview"
+							title="Quran Vid Overview"
 							allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
 							allowfullscreen
 						></iframe>

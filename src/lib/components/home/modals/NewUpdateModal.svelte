@@ -46,7 +46,7 @@
 
 	async function openUpdateUrl() {
 		try {
-			await openUrl('https://github.com/zonetecde/QuranCaption/releases/latest');
+			await openUrl('https://github.com/sherifcodeur/QuranVid/releases/latest');
 		} catch (error) {
 			console.error('Failed to open URL:', error);
 			toast.error('Failed to open release page');

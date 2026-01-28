@@ -54,7 +54,7 @@ class VersionService {
 		try {
 			// récupère jusqu'à 100 releases (ajuster la pagination si besoin)
 			const response = await fetch(
-				'https://api.github.com/repos/zonetecde/qurancaption/releases?per_page=100'
+				'https://api.github.com/repos/sherifcodeur/QuranVid/releases?per_page=100'
 			);
 			if (!response.ok) {
 				throw new Error('Failed to fetch releases');
@@ -64,10 +64,10 @@ class VersionService {
 				return { hasUpdate: false, changelog: '', latestVersion: '0.0.0' };
 			}
 
-			// filtrer seulement les releases qui commencent par "QC-" et ne sont pas des pre-releases
+			// filtrer seulement les releases qui commencent par "QV-" et ne sont pas des pre-releases
 			const qcReleases = releases.filter((r: any) => {
 				const tag = r.tag_name || '';
-				return tag.startsWith('QC-') && !r.prerelease;
+				return tag.startsWith('QV-') && !r.prerelease;
 			});
 
 			if (qcReleases.length === 0) {
@@ -98,8 +98,8 @@ class VersionService {
 				})
 				.join('\n\n');
 
-			// extraire la partie numérique du tag le plus élevé (enlever "QC-")
-			const latestVersionNumber = highest.startsWith('QC-') ? highest.substring(3) : highest;
+			// extraire la partie numérique du tag le plus élevé (enlever "QV-")
+			const latestVersionNumber = highest.startsWith('QV-') ? highest.substring(3) : highest;
 
 			return {
 				hasUpdate: newer.length > 0,

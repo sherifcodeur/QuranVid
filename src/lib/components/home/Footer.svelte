@@ -8,7 +8,7 @@
 		<div
 			class="flex flex-col sm:flex-row justify-center items-center space-y-2 sm:space-y-0 sm:space-x-6 mb-4"
 		>
-			<ClickableLink url="https://github.com/zonetecde/QuranCaption-2" label="GitHub Repo" />
+			<ClickableLink url="https://github.com/sherifcodeur/QuranVid" label="GitHub Repo" />
 
 			<ClickableLink
 				url="https://qurancaption-project.vercel.app/documentation"
@@ -18,6 +18,6 @@
 
 			<ClickableLink url="https://ko-fi.com/vzero" label="Donate" />
 		</div>
-		<p class="mb-1">© 2026 Quran Caption. Made by Rayane STASZEWSKI.</p>
+		<p class="mb-1">© 2026 Quran Vid. Made by Rayane STASZEWSKI.</p>
 	</div>
 </footer>

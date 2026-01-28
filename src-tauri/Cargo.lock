@@ -3,6 +3,36 @@
 version = 3
 
 [[package]]
+name = "QuranVid"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+ "dirs",
+ "discord-rich-presence",
+ "fix-path-env",
+ "font-kit",
+ "glyphon",
+ "image",
+ "lazy_static",
+ "log",
+ "md5",
+ "pollster",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tauri-plugin-store",
+ "tokio",
+ "wgpu",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3685,36 +3715,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "qurancaption"
-version = "3.3.0"
-dependencies = [
- "bytemuck",
- "dirs",
- "discord-rich-presence",
- "fix-path-env",
- "font-kit",
- "glyphon",
- "image",
- "lazy_static",
- "log",
- "md5",
- "pollster",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-log",
- "tauri-plugin-opener",
- "tauri-plugin-store",
- "tokio",
- "wgpu",
 ]
 
 [[package]]
